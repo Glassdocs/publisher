@@ -74,6 +74,18 @@ on:
         required: false
         type: string
         default: ""
+    # Declared so callers in ANOTHER organization can pass them explicitly —
+    # `secrets: inherit` only forwards within the same org/enterprise, so a
+    # cross-org caller (a customer repo calling Glassdocs/publisher) MUST map
+    # these by name. Optional so a not-yet-connected repo still runs and hits
+    # the credential preflight with a clear message instead of a hard gate.
+    secrets:
+      CLOUDFLARE_API_TOKEN:
+        description: "Cloudflare API token (Pages:Edit + Access: Apps and Policies:Edit)"
+        required: false
+      CLOUDFLARE_ACCOUNT_ID:
+        description: "Cloudflare account id that owns the Pages project"
+        required: false
 
 jobs:
   deploy:

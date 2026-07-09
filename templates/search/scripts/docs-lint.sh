@@ -60,12 +60,11 @@ tracked_file() {
   fi
 }
 
-# 1. Workflow filename check
-if [ -f .github/workflows/deploy.yml ]; then
-  fail ".github/workflows/deploy.yml found - rename to docs-deploy.yml"
-fi
-if [ ! -f .github/workflows/docs-deploy.yml ]; then
-  warn "No .github/workflows/docs-deploy.yml found"
+# 1. A KB must have a deploy workflow. Glassdocs standardises on
+#    .github/workflows/deploy.yml — the platform scaffolds it and dispatches
+#    it by that name. docs-deploy.yml is the legacy name and still accepted.
+if [ ! -f .github/workflows/deploy.yml ] && [ ! -f .github/workflows/docs-deploy.yml ]; then
+  warn "No deploy workflow (.github/workflows/deploy.yml) found"
 fi
 
 # 2. Brand assets must not be tracked in $DOCS_DIR/

@@ -1,0 +1,598 @@
+# ═══════════════════════════════════════════════════════════════════════
+# Reusable secure-by-default Cloudflare Pages deployment
+#
+# Called by a consumer KB repo. Guarantees:
+#   1. Cloudflare Access app + an allow policy exist (fail-closed if none match)
+#   2. Site is NOT publicly accessible before deploy (pre-flight)
+#   3. Site deploys to Cloudflare Pages
+#   4. On first deploy, Access app is created immediately after Pages project exists
+#   5. Site is NOT publicly accessible after deploy (post-deploy)
+#   6. If post-deploy check fails, deployment is rolled back (deleted)
+#
+# Usage in caller repo:
+#   jobs:
+#     deploy:
+#       uses: Glassdocs/glassdocs/.github/workflows/deploy-pages.yml@main
+#       with:
+#         project-name: your-pages-project
+#       secrets: inherit
+# ═══════════════════════════════════════════════════════════════════════
+
+name: Docs Deploy (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      project-name:
+        description: "Cloudflare Pages project name (becomes <project-name>.pages.dev)"
+        required: true
+        type: string
+      deploy-dir:
+        description: "Directory to deploy (default: docs)"
+        required: false
+        type: string
+        default: "docs"
+      fetch-brand-assets:
+        description: "Fetch shared brand assets (styles.css, logo.svg, favicon.svg, nav.css, robots.txt, _headers) from Glassdocs at deploy time. Default: true."
+        required: false
+        type: boolean
+        default: true
+      wrangler-version:
+        description: "Pin a specific Wrangler version (leave empty for latest)"
+        required: false
+        type: string
+        default: ""
+      pre-deploy-steps:
+        description: "JSON array of run commands to execute before deploy (e.g. build steps)"
+        required: false
+        type: string
+        default: "[]"
+      email-domain:
+        description: "Staff email domain for the allow policy (e.g. acme.com). Empty (default) = NO domain-level access; grant specific people via allowed-emails / client-emails. Fail-closed: a KB with no access inputs deploys locked."
+        required: false
+        type: string
+        default: ""
+      allowed-emails:
+        description: "Comma-separated email addresses to allow. If email-domain is empty, ONLY these emails get access."
+        required: false
+        type: string
+        default: ""
+      client-emails:
+        description: "Comma-separated client email addresses to allow on this KB (in addition to the staff email-domain, if any)"
+        required: false
+        type: string
+        default: ""
+      client-domain:
+        description: "A single client email domain to allow on this KB (in addition to the staff email-domain, if any)"
+        required: false
+        type: string
+        default: ""
+      generate-changelog:
+        description: "Auto-generate changelog.html from git history at deploy time"
+        required: false
+        type: boolean
+        default: false
+      generate-sitemap:
+        description: "Auto-generate sitemap.html indexing all pages at deploy time"
+        required: false
+        type: boolean
+        default: false
+      inject-page-meta:
+        description: "Inject last-updated stamps and Edit on GitHub links into page footers"
+        required: false
+        type: boolean
+        default: false
+      generate-references:
+        description: "Generate docs/references/index.html from docs/references/manifest.json. No-op when the manifest is absent. Default: true."
+        required: false
+        type: boolean
+        default: true
+      allow-financial:
+        description: "Allow financial/contractual content in docs/ (only for pre-sales)"
+        required: false
+        type: boolean
+        default: false
+      allow-inline-styles:
+        description: "Allow pages that don't link shared styles.css (legacy migrations)"
+        required: false
+        type: boolean
+        default: false
+      skip-lint:
+        description: "Skip the compliance lint step (not recommended)"
+        required: false
+        type: boolean
+        default: false
+      enable-search:
+        description: "Enable client-side search via Pagefind (default: true). Injects search markup into pages that don't have it and builds the index at deploy time."
+        required: false
+        type: boolean
+        default: true
+      inject-nav:
+        description: "Inject topbar navigation from docs/nav.json into every page. Also enforces two lint rules: every *.html must be in nav.json or navSkip, and every href must resolve to a file. Opt-in: default false."
+        required: false
+        type: boolean
+        default: false
+      nav-check:
+        description: "Nav integrity gate: verify the site menu (docs/nav.json or mkdocs.yml) doesn't point at missing pages or silently drop real pages. 'warn' (default) annotates only; 'error' fails the deploy on a broken menu reference; 'off' disables. Default 'warn' so it never breaks an existing repo's deploy unexpectedly - set 'error' to enforce."
+        required: false
+        type: string
+        default: "warn"
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      deployments: write
+    env:
+      PROJECT_NAME: ${{ inputs.project-name }}
+      DEPLOY_DIR: ${{ inputs.deploy-dir }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Glassdocs is public, so the shared-asset fetch needs no
+      # authentication. Sparse-checkout pulls only the files we need.
+      - name: Fetch Glassdocs assets
+        uses: actions/checkout@v4
+        with:
+          repository: Glassdocs/publisher
+          ref: v1
+          path: _playbook
+          sparse-checkout: |
+            docs/styles.css
+            brand/assets/logo.svg
+            brand/assets/favicon.svg
+            templates/nav.css
+            templates/robots.txt
+            templates/_headers
+            templates/search/scripts/
+
+      # Compliance lint - fails deploy on violations (before any side effects)
+      - name: Run docs compliance lint
+        if: ${{ !inputs.skip-lint }}
+        env:
+          DOCS_DIR: ${{ inputs.deploy-dir }}
+          ALLOW_FINANCIAL: ${{ inputs.allow-financial }}
+          ALLOW_INLINE_STYLES: ${{ inputs.allow-inline-styles }}
+        run: |
+          set -uo pipefail
+          out=$(bash _playbook/templates/search/scripts/docs-lint.sh) || rc=$?
+          rc=${rc:-0}
+          echo "$out" | while IFS= read -r line; do
+            case "$line" in
+              FAIL:*) echo "::error::${line#FAIL: }" ;;
+              WARN:*) echo "::warning::${line#WARN: }" ;;
+              *)      echo "$line" ;;
+            esac
+          done
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::Docs lint failed. See https://github.com/Glassdocs/glassdocs for playbook rules. Deploy blocked."
+            exit "$rc"
+          fi
+
+      # Nav integrity - catch a menu (docs/nav.json or mkdocs.yml) that points at
+      # a missing page or has silently dropped real pages, BEFORE any side effect.
+      # Warn-only by default so it never breaks an existing repo's deploy; set
+      # nav-check: error to block on a broken menu reference.
+      - name: Validate nav integrity
+        if: ${{ inputs.nav-check != 'off' }}
+        env:
+          DOCS_DIR: ${{ inputs.deploy-dir }}
+          NAV_CHECK: ${{ inputs.nav-check }}
+        run: |
+          set -uo pipefail
+          out=$(node _playbook/templates/search/scripts/validate-nav.mjs) || rc=$?
+          rc=${rc:-0}
+          level="warning"; [ "$NAV_CHECK" = "error" ] && level="error"
+          echo "$out" | while IFS= read -r line; do
+            case "$line" in
+              FAIL:*) echo "::${level}::${line#FAIL: }" ;;
+              WARN:*) echo "::warning::${line#WARN: }" ;;
+              *)      echo "$line" ;;
+            esac
+          done
+          if [ "$rc" -ne 0 ] && [ "$NAV_CHECK" = "error" ]; then
+            echo "::error::Nav integrity check failed - the site menu references a missing page. Deploy blocked (nav-check: error)."
+            exit 1
+          fi
+
+      # Resolve feature flags. docs/features.json wins when a key is set;
+      # missing keys fall through to the workflow inputs so older repos
+      # that haven't adopted features.json keep working. Schema lives at
+      # templates/features.schema.json in Glassdocs.
+      - name: Resolve feature flags (docs/features.json > workflow inputs)
+        id: features
+        run: |
+          set -euo pipefail
+          features_file="${{ inputs.deploy-dir }}/features.json"
+          if [ -f "$features_file" ]; then
+            echo "Using $features_file"
+            read_feature() {
+              val=$(jq -r --arg k "$1" '.[$k] // empty' "$features_file")
+              [ -z "$val" ] && val="$2"
+              echo "$val"
+            }
+          else
+            echo "No $features_file; using workflow inputs."
+            read_feature() { echo "$2"; }
+          fi
+          {
+            echo "changelog=$(read_feature changelog '${{ inputs.generate-changelog }}')"
+            echo "sitemap=$(read_feature sitemap '${{ inputs.generate-sitemap }}')"
+            echo "pageMeta=$(read_feature pageMeta '${{ inputs.inject-page-meta }}')"
+            echo "references=$(read_feature references '${{ inputs.generate-references }}')"
+            echo "nav=$(read_feature nav '${{ inputs.inject-nav }}')"
+            echo "search=$(read_feature search '${{ inputs.enable-search }}')"
+            echo "toc=$(read_feature toc 'false')"
+            echo "tocPlacement=$(read_feature tocPlacement 'inline')"
+            # codeBlocks is the canonical key; the legacy "codeblocks"
+            # form is read as a backward-compat alias so existing sites
+            # don't break when they next deploy. Drop the alias once
+            # all sites have migrated.
+            echo "codeBlocks=$(read_feature codeBlocks "$(read_feature codeblocks 'false')")"
+            echo "callouts=$(read_feature callouts 'false')"
+            echo "prevNext=$(read_feature prevNext 'false')"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Copy shared brand assets into deploy dir
+        if: inputs.fetch-brand-assets
+        run: |
+          cp _playbook/docs/styles.css "${{ inputs.deploy-dir }}/styles.css"
+          cp _playbook/brand/assets/logo.svg "${{ inputs.deploy-dir }}/logo.svg"
+          cp _playbook/brand/assets/favicon.svg "${{ inputs.deploy-dir }}/favicon.svg"
+          cp _playbook/templates/robots.txt "${{ inputs.deploy-dir }}/robots.txt"
+          # nav.css is optional - only copy if any page references it
+          if grep -ql 'nav\.css' "${{ inputs.deploy-dir }}"/*.html 2>/dev/null; then
+            cp _playbook/templates/nav.css "${{ inputs.deploy-dir }}/nav.css"
+          fi
+
+      # _headers (security headers + CSP) ALWAYS comes from the playbook
+      # template, regardless of fetch-brand-assets. Branding is per-site
+      # opt-in; security headers are not. Tying them together caused the
+      # playbook itself to ship a stale CSP that blocked Pagefind's WASM
+      # because fetch-brand-assets:false skipped this step.
+      - name: Copy security headers into deploy dir
+        run: cp _playbook/templates/_headers "${{ inputs.deploy-dir }}/_headers"
+
+      # Run centralised generator scripts from Glassdocs
+      - name: Generate changelog
+        if: steps.features.outputs.changelog == 'true'
+        run: node _playbook/templates/search/scripts/generate-changelog.mjs --repo .
+
+      - name: Generate sitemap
+        if: steps.features.outputs.sitemap == 'true'
+        run: node _playbook/templates/search/scripts/generate-sitemap.mjs --repo .
+
+      - name: Generate references index
+        if: steps.features.outputs.references == 'true'
+        run: node _playbook/templates/search/scripts/generate-references.mjs --repo .
+
+      - name: Inject page metadata
+        if: steps.features.outputs.pageMeta == 'true'
+        run: node _playbook/templates/search/scripts/inject-page-meta.mjs --repo .
+
+      - name: Inject topbar nav
+        if: steps.features.outputs.nav == 'true'
+        run: node _playbook/templates/search/scripts/inject-nav.mjs --repo .
+
+      # Per-page table of contents from h2/h3 inside <main>. Idempotent;
+      # skips pages with <2 headings or marked <!-- @no-toc -->. Runs
+      # BEFORE add-heading-ids (search add-on) because both ensure ids;
+      # running toc first keeps id ownership with the toc when both are
+      # enabled (toc's slug may collide with search's, last-write-wins).
+      - name: Inject per-page TOC
+        if: steps.features.outputs.toc == 'true'
+        run: |
+          node _playbook/templates/search/scripts/inject-toc.mjs --repo . \
+            --placement "${{ steps.features.outputs.tocPlacement }}"
+
+      # Copy-to-clipboard buttons on every <pre> in <main>. Inline JS+CSS,
+      # no external assets. Idempotent; per-page opt-out via
+      # <!-- @no-codeblocks -->.
+      - name: Inject code-block copy buttons
+        if: steps.features.outputs.codeBlocks == 'true'
+        run: node _playbook/templates/search/scripts/inject-codeblocks.mjs --repo .
+
+      # Callout block CSS (note/tip/warn/danger) for pages that use any
+      # <div class="callout ..."> element. Pure CSS, no JS. Idempotent;
+      # per-page opt-out via <!-- @no-callouts -->.
+      - name: Inject callout styles
+        if: steps.features.outputs.callouts == 'true'
+        run: node _playbook/templates/search/scripts/inject-callouts.mjs --repo .
+
+      # Sequential prev/next page navigation derived from nav.json.
+      # Pages not in nav (404, sitemap, changelog, etc.) are skipped.
+      # Per-page opt-out via <!-- @no-prev-next -->.
+      - name: Inject prev/next nav
+        if: steps.features.outputs.prevNext == 'true'
+        run: node _playbook/templates/search/scripts/inject-prev-next.mjs --repo .
+
+      # Sitewide branding: CSS var overrides for accent/line/text/bg
+      # colors + topbar logo src/alt rewrite. Reads features.json
+      # branding block directly. Self-gates (no-op when the block is
+      # absent or has no recognised keys), so we run unconditionally
+      # and let the script decide.
+      - name: Inject branding
+        run: node _playbook/templates/search/scripts/inject-branding.mjs --repo .
+
+      # Tells the Glassdocs browser extension which GitHub repo backs
+      # this docs site. Always-on - the meta tag is small and harmless
+      # for sites that don't use the extension. ${{ github.repository }}
+      # resolves to "owner/name" of the calling repo, exactly what the
+      # extension needs.
+      - name: Inject docs-repo meta tag
+        run: |
+          node _playbook/templates/search/scripts/inject-docs-repo-meta.mjs \
+            --repo . \
+            --docs-repo "${{ github.repository }}"
+
+      # Set all page titles to the site name (from index.html badge) so
+      # browser tabs stay consistent across navigation. Skips PDF-style pages.
+      - name: Normalise page titles
+        run: node _playbook/templates/search/scripts/normalize-title.mjs --repo .
+
+      # Client-side search via Pagefind - centralised so repos don't need
+      # package.json, pagefind config, or add-heading-ids.mjs locally.
+      - name: Inject search markup
+        if: steps.features.outputs.search == 'true'
+        run: node _playbook/templates/search/scripts/inject-search.mjs --repo .
+
+      - name: Add heading IDs for search sub-results
+        if: steps.features.outputs.search == 'true'
+        run: node _playbook/templates/search/scripts/add-heading-ids.mjs "${{ inputs.deploy-dir }}"/*.html
+
+      - name: Build Pagefind index
+        if: steps.features.outputs.search == 'true'
+        run: npx --yes pagefind@1.5.0 --site "${{ inputs.deploy-dir }}"
+
+      # Run any pre-deploy steps (build, generate PDFs, etc.)
+      - name: Pre-deploy build steps
+        if: inputs.pre-deploy-steps != '[]'
+        run: |
+          echo '${{ inputs.pre-deploy-steps }}' | jq -r '.[]' | while IFS= read -r cmd; do
+            echo "Running: $cmd"
+            eval "$cmd"
+          done
+
+      # ── 1. Ensure Cloudflare Access app exists ──
+      # On first deploy the Pages project doesn't exist yet, so Access app
+      # creation will fail. We record that and create it after deploy instead.
+      - name: Ensure Cloudflare Access app
+        id: access
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          DOMAIN="${PROJECT_NAME}.pages.dev"
+          BASE="https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/access"
+
+          echo "domain=${DOMAIN}" >> "$GITHUB_OUTPUT"
+
+          # Find existing Access app (paginate through all pages)
+          APP_ID=""
+          PAGE=1
+          while true; do
+            LIST_RESPONSE=$(curl -s "${BASE}/apps?page=${PAGE}&per_page=50" \
+              -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}")
+            LIST_SUCCESS=$(echo "$LIST_RESPONSE" | jq -r '.success // false')
+            if [ "$LIST_SUCCESS" != "true" ]; then
+              echo "::error::Failed to list Access apps: $(echo "$LIST_RESPONSE" | jq -r '.errors[0].message // "unknown"')"
+              echo "$LIST_RESPONSE" >&2
+              exit 1
+            fi
+            MATCH=$(echo "$LIST_RESPONSE" | \
+              jq -r --arg d "$DOMAIN" \
+                '(.result // [])[] | select(.self_hosted_domains[]? == $d or .domain == $d) | .id' | head -1)
+            if [ -n "$MATCH" ]; then
+              APP_ID="$MATCH"
+              break
+            fi
+            COUNT=$(echo "$LIST_RESPONSE" | jq -r '(.result // []) | length')
+            TOTAL_PAGES=$(echo "$LIST_RESPONSE" | jq -r '.result_info.total_pages // 1')
+            echo "Page ${PAGE}/${TOTAL_PAGES}: ${COUNT} apps, no match for ${DOMAIN}"
+            if [ "$PAGE" -ge "$TOTAL_PAGES" ] || [ "$COUNT" = "0" ]; then
+              break
+            fi
+            PAGE=$((PAGE + 1))
+          done
+
+          if [ -n "$APP_ID" ]; then
+            echo "Found existing Access app: $APP_ID"
+            echo "app_id=${APP_ID}" >> "$GITHUB_OUTPUT"
+            echo "access_ready=true" >> "$GITHUB_OUTPUT"
+          else
+            # Try to create — will fail on first deploy (Pages project doesn't exist yet)
+            CREATE_RESPONSE=$(curl -s -X POST "${BASE}/apps" \
+              -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d "{
+                \"name\":\"${PROJECT_NAME}\",
+                \"domain\":\"${DOMAIN}\",
+                \"type\":\"self_hosted\",
+                \"session_duration\":\"24h\"
+              }")
+            APP_ID=$(echo "$CREATE_RESPONSE" | jq -r '.result.id // empty')
+
+            if [ -n "$APP_ID" ]; then
+              echo "Created Access app: $APP_ID"
+              echo "app_id=${APP_ID}" >> "$GITHUB_OUTPUT"
+              echo "access_ready=true" >> "$GITHUB_OUTPUT"
+            else
+              ERROR=$(echo "$CREATE_RESPONSE" | jq -r '.errors[0].message // "unknown"')
+              if echo "$ERROR" | grep -qE "domain does not belong to zone|internal_server_error"; then
+                echo "::warning::Pages project does not exist yet — Access app will be created after first deploy."
+                echo "access_ready=false" >> "$GITHUB_OUTPUT"
+              else
+                echo "::error::Failed to create Access app: $ERROR"
+                echo "$CREATE_RESPONSE" >&2; exit 1
+              fi
+            fi
+          fi
+
+      # ── 1b. Merge allowed-emails + client-emails ──
+      - name: Merge email lists
+        id: emails
+        run: |
+          ALL=""
+          [ -n "${{ inputs.allowed-emails }}" ] && ALL="${{ inputs.allowed-emails }}"
+          if [ -n "${{ inputs.client-emails }}" ]; then
+            [ -n "$ALL" ] && ALL="${ALL},"
+            ALL="${ALL}${{ inputs.client-emails }}"
+          fi
+          echo "merged=${ALL}" >> "$GITHUB_OUTPUT"
+
+      # ── 1c. Sync managed Access policies (allow + optional bypass) ──
+      - name: Sync Access policies
+        if: steps.access.outputs.access_ready == 'true'
+        uses: Glassdocs/publisher/.github/actions/sync-access-policies@v1
+        with:
+          app-id: ${{ steps.access.outputs.app_id }}
+          cf-api-token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          cf-account-id: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          email-domain: ${{ inputs.email-domain }}
+          client-emails: ${{ steps.emails.outputs.merged }}
+          client-domain: ${{ inputs.client-domain }}
+          office-cidrs: ${{ vars.OFFICE_CIDRS }}
+
+      # ── 2. Pre-flight: confirm Access is gating the domain ──
+      - name: Pre-flight — verify Access is active
+        if: steps.access.outputs.access_ready == 'true'
+        env:
+          DOMAIN: ${{ steps.access.outputs.domain }}
+        run: |
+          set -euo pipefail
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            --max-time 15 "https://${DOMAIN}" 2>/dev/null || echo "000")
+
+          echo "Pre-flight: https://${DOMAIN} returned HTTP ${HTTP_STATUS}"
+
+          if [ "$HTTP_STATUS" = "200" ]; then
+            echo "::error::BLOCKED — site is publicly accessible BEFORE deploy. Access is not active."
+            echo "::error::Check Cloudflare Zero Trust → Access → Applications for ${DOMAIN}"
+            exit 1
+          fi
+
+          # 302/303 = Access login redirect (good)
+          # 000     = site doesn't exist yet (first deploy — safe)
+          # 4xx/5xx = site is down (safe to proceed)
+          if [ "$HTTP_STATUS" = "000" ]; then
+            echo "First deploy — site does not exist yet. Access app is pre-configured."
+          else
+            echo "Access is active (HTTP ${HTTP_STATUS})"
+          fi
+
+      # ── 3. Ensure Pages project exists (first deploy) ──
+      - name: Ensure Pages project exists
+        if: steps.access.outputs.access_ready == 'false'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          echo "Creating Pages project ${PROJECT_NAME}..."
+          npx wrangler pages project create "$PROJECT_NAME" --production-branch main 2>&1 || true
+
+      # ── 4. Deploy to Cloudflare Pages ──
+      - name: Deploy to Cloudflare Pages
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          wranglerVersion: ${{ inputs.wrangler-version || '' }}
+          command: pages deploy ${{ inputs.deploy-dir }} --project-name=${{ inputs.project-name }}
+
+      # ── 5. First deploy: create Access app now that Pages project exists ──
+      - name: Create Access app (first deploy)
+        id: access-firstdeploy
+        if: steps.access.outputs.access_ready == 'false'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          DOMAIN: ${{ steps.access.outputs.domain }}
+        run: |
+          set -euo pipefail
+          BASE="https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/access"
+
+          echo "Pages project now exists. Creating Access app for ${DOMAIN}..."
+
+          CREATE_RESPONSE=$(curl -s -X POST "${BASE}/apps" \
+            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"name\":\"${PROJECT_NAME}\",
+              \"domain\":\"${DOMAIN}\",
+              \"type\":\"self_hosted\",
+              \"session_duration\":\"24h\"
+            }")
+          APP_ID=$(echo "$CREATE_RESPONSE" | jq -r '.result.id // empty')
+
+          if [ -z "$APP_ID" ]; then
+            echo "::error::Failed to create Access app after deploy. Site may be publicly accessible!"
+            echo "$CREATE_RESPONSE" >&2
+
+            # Roll back — delete the deployment since we can't protect it
+            DEPLOYMENTS=$(curl -s \
+              "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/pages/projects/${PROJECT_NAME}/deployments" \
+              -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}")
+            LATEST_ID=$(echo "$DEPLOYMENTS" | jq -r '.result[0].id // empty')
+            if [ -n "$LATEST_ID" ]; then
+              curl -s -X DELETE \
+                "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/pages/projects/${PROJECT_NAME}/deployments/${LATEST_ID}?force=true" \
+                -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}"
+              echo "Rolled back deployment ${LATEST_ID}"
+            fi
+            exit 1
+          fi
+
+          echo "Created Access app: $APP_ID"
+          echo "app_id=${APP_ID}" >> "$GITHUB_OUTPUT"
+
+      - name: Sync Access policies (first deploy)
+        if: steps.access.outputs.access_ready == 'false'
+        uses: Glassdocs/publisher/.github/actions/sync-access-policies@v1
+        with:
+          app-id: ${{ steps.access-firstdeploy.outputs.app_id }}
+          cf-api-token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          cf-account-id: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          email-domain: ${{ inputs.email-domain }}
+          client-emails: ${{ steps.emails.outputs.merged }}
+          client-domain: ${{ inputs.client-domain }}
+          office-cidrs: ${{ vars.OFFICE_CIDRS }}
+
+      # ── 6. Post-deploy: verify the live site is gated ──
+      - name: Post-deploy — verify site is protected
+        env:
+          DOMAIN: ${{ steps.access.outputs.domain }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          echo "Waiting for deployment to propagate..."
+          sleep 15
+
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            --max-time 15 "https://${DOMAIN}" || echo "000")
+
+          echo "Post-deploy: https://${DOMAIN} returned HTTP ${HTTP_STATUS}"
+
+          if [ "$HTTP_STATUS" = "200" ]; then
+            echo "::error::SITE IS PUBLICLY ACCESSIBLE after deploy — rolling back"
+
+            # Delete the latest deployment
+            DEPLOYMENTS=$(curl -s \
+              "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/pages/projects/${PROJECT_NAME}/deployments" \
+              -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}")
+            LATEST_ID=$(echo "$DEPLOYMENTS" | jq -r '.result[0].id // empty')
+
+            if [ -n "$LATEST_ID" ]; then
+              curl -s -X DELETE \
+                "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/pages/projects/${PROJECT_NAME}/deployments/${LATEST_ID}?force=true" \
+                -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}"
+              echo "Rolled back deployment ${LATEST_ID}"
+            fi
+
+            exit 1
+          fi
+
+          echo "Deployment verified — site is protected (HTTP ${HTTP_STATUS})"

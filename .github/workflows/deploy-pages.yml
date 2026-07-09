@@ -246,9 +246,25 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
           set -euo pipefail
-          DOMAIN="${PROJECT_NAME}.pages.dev"
+          # Derive the Access domain from the project's ACTUAL subdomain, not the
+          # project name. On a GLOBAL pages.dev name collision Cloudflare assigns a
+          # suffixed subdomain (e.g. <name>-xyz.pages.dev); protecting <name>.pages.dev
+          # would target a domain owned by a DIFFERENT account and fail forever with
+          # Access error 12130 "domain does not belong to zone". Query the real
+          # subdomain when the project exists; fall back to the name-based domain only
+          # on a true first deploy (project not created yet).
+          PROJ_JSON=$(curl -s "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/pages/projects/${PROJECT_NAME}" \
+            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}")
+          DOMAIN=$(printf '%s' "$PROJ_JSON" | jq -r '.result.subdomain // empty')
+          if [ -z "$DOMAIN" ]; then
+            DOMAIN="${PROJECT_NAME}.pages.dev"
+            echo "Project not created yet — using name-based domain ${DOMAIN} for now."
+          elif [ "$DOMAIN" != "${PROJECT_NAME}.pages.dev" ]; then
+            echo "::warning::pages.dev name collision: this project's real domain is ${DOMAIN}, not ${PROJECT_NAME}.pages.dev (the plain name is taken by another Cloudflare account). Protecting the real domain. To get the clean URL, delete this Pages project and redeploy once the plain name is free."
+          fi
           BASE="https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/access"
 
+          echo "Access domain resolved to ${DOMAIN}"
           echo "domain=${DOMAIN}" >> "$GITHUB_OUTPUT"
 
           # Find existing Access app (paginate through all pages)
@@ -440,39 +456,41 @@ jobs:
           set -euo pipefail
           BASE="https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/access"
 
+          # On a TRUE first deploy the earlier step used the name-based domain because
+          # the project didn't exist yet. Now it does — re-read its ACTUAL subdomain,
+          # which is what the site is really served at (Cloudflare may have assigned a
+          # collision suffix, e.g. <name>-xyz.pages.dev). Protecting anything else
+          # yields Access error 12130 forever.
+          REAL=$(curl -s "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/pages/projects/${PROJECT_NAME}" \
+            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" | jq -r '.result.subdomain // empty')
+          [ -n "$REAL" ] && DOMAIN="$REAL"
           echo "Pages project now exists. Creating Access app for ${DOMAIN}..."
 
-          # A brand-new pages.dev domain is NOT immediately eligible for a self-hosted
-          # Access app: Cloudflare returns error 12130 "domain does not belong to zone"
-          # for several minutes after the domain is first provisioned, then starts
-          # accepting the (identical) request. Confirmed empirically: the same POST
-          # failed at +3m and +8m after project creation and succeeded at ~+11m.
-          # So we RETRY on 12130 (and transient 5xx) with backoff, LOGGING every
-          # attempt's error code/message + timestamp — that way a genuinely different
-          # (non-transient) failure is visible in the logs instead of being masked by
-          # a blanket "creation failed". We do NOT tear down the deployment on failure:
-          # the previous rollback couldn't delete an active production deployment
-          # (error 8000034) and only made re-runs restart the clock.
-          APP_ID=""; LAST=""; ATTEMPTS=18   # 18 × 20s ≈ 6 min
-          for i in $(seq 1 "$ATTEMPTS"); do
+          # Create with a SHORT retry for genuine transient 5xx only. 12130
+          # "domain does not belong to zone" here is NOT transient: with the real
+          # subdomain it means this Cloudflare account doesn't own the domain (a
+          # global name collision / the KB is wired to the wrong account) — retrying
+          # can never fix it, so fail fast with an actionable message.
+          APP_ID=""; LAST=""
+          for attempt in 1 2 3; do
             LAST=$(curl -s -X POST "${BASE}/apps" \
               -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
               -H "Content-Type: application/json" \
               -d "{\"name\":\"${PROJECT_NAME}\",\"domain\":\"${DOMAIN}\",\"type\":\"self_hosted\",\"session_duration\":\"24h\"}")
             APP_ID=$(printf '%s' "$LAST" | jq -r '.result.id // empty')
-            if [ -n "$APP_ID" ]; then echo "Created Access app on attempt ${i}: ${APP_ID}"; break; fi
+            if [ -n "$APP_ID" ]; then echo "Created Access app on attempt ${attempt}: ${APP_ID}"; break; fi
             CODE=$(printf '%s' "$LAST" | jq -r '.errors[0].code // empty')
             MSG=$(printf '%s' "$LAST" | jq -r '.errors[0].message // "unknown"')
-            echo "attempt ${i}/${ATTEMPTS} @ $(date -u +%H:%M:%SZ): code=${CODE} msg=${MSG}"
-            case "$CODE" in
-              12130|1000|10000) : ;;   # domain-not-yet-in-zone / transient — keep retrying
-              *) echo "::error::Access app creation failed with a non-retryable Cloudflare error (code ${CODE}): ${MSG}"; echo "$LAST" >&2; exit 1 ;;
-            esac
-            sleep 20
+            echo "attempt ${attempt}/3 @ $(date -u +%H:%M:%SZ): code=${CODE} msg=${MSG}"
+            if [ "$CODE" = "12130" ]; then
+              echo "::error::Cloudflare says ${DOMAIN} does not belong to this account (Access error 12130). The site deployed here, but this account doesn't own that pages.dev domain — usually a global name collision (the plain <name>.pages.dev is taken by another account, so this project got a suffixed domain) or the KB is wired to the wrong Cloudflare account. Fix: delete this Pages project and redeploy once the plain name is free, or reconnect the KB to the account that owns the domain. The deployment is left in place."
+              echo "$LAST" >&2; exit 1
+            fi
+            sleep 8
           done
 
           if [ -z "$APP_ID" ]; then
-            echo "::error::Couldn't create the Access app for ${DOMAIN} after ${ATTEMPTS} attempts (~6 min); Cloudflare kept returning 'domain does not belong to zone' (12130). A brand-new pages.dev domain can take several minutes to become eligible — the deployment is LEFT IN PLACE, so just re-run this deploy in a few minutes and it will attach Access. Last response below."
+            echo "::error::Couldn't create the Access app for ${DOMAIN} after 3 attempts. Last response below. The deployment is left in place; re-run once resolved."
             echo "$LAST" >&2
             exit 1
           fi

@@ -365,20 +365,25 @@ jobs:
           fi
 
       # ── 3. Ensure the Pages project exists AND is a DIRECT-UPLOAD project ──
-      # Runs every deploy. Creates the project on first deploy, and on every deploy
-      # verifies it isn't a Cloudflare "Connect to Git" project. A Git-connected
-      # project only accepts Cloudflare-side builds, so `wrangler pages deploy`
-      # (what we do) fails on it with the opaque "No migration path exists –
-      # existing projects cannot be upgraded". Detect that here and explain the fix
-      # instead of leaking the raw wrangler error.
+      # Runs every deploy. On first deploy it CREATES the project (direct upload);
+      # on every deploy it verifies the project isn't a Cloudflare "Connect to Git"
+      # project (those only accept Cloudflare-side builds, so `wrangler pages
+      # deploy` fails on them). Both checks matter because the downstream deploy
+      # step's own errors are opaque: a Git-connected project surfaces as "No
+      # migration path exists", and a project that failed to create surfaces as the
+      # misleading "The Pages project ... does not exist". We resolve both here and
+      # print an actionable message instead. Project creation is done via the API
+      # (not `wrangler ... || true`) so a transient Cloudflare error (code 8000000)
+      # is RETRIED, and a persistent failure hard-fails with the real error rather
+      # than being swallowed and mis-surfaced two steps later.
       - name: Ensure Pages project (direct-upload)
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
           set -euo pipefail
-          API="https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/pages/projects/${PROJECT_NAME}"
-          RESP=$(curl -s -w $'\n%{http_code}' "$API" -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}")
+          BASE="https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/pages/projects"
+          RESP=$(curl -s -w $'\n%{http_code}' "${BASE}/${PROJECT_NAME}" -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}")
           CODE=$(printf '%s' "$RESP" | tail -n1)
           BODY=$(printf '%s' "$RESP" | sed '$d')
           if [ "$CODE" = "200" ]; then
@@ -390,10 +395,28 @@ jobs:
             echo "Pages project '${PROJECT_NAME}' exists (direct-upload) — OK."
           elif [ "$CODE" = "404" ]; then
             echo "Creating direct-upload Pages project '${PROJECT_NAME}'..."
-            npx wrangler pages project create "$PROJECT_NAME" --production-branch main 2>&1 \
-              || echo "::warning::project create returned non-zero (it may already exist from a concurrent run) — continuing to deploy."
+            created=false
+            for attempt in 1 2 3; do
+              CR=$(curl -s -w $'\n%{http_code}' -X POST "$BASE" \
+                -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" -H "Content-Type: application/json" \
+                --data "{\"name\":\"${PROJECT_NAME}\",\"production_branch\":\"main\"}")
+              CRCODE=$(printf '%s' "$CR" | tail -n1)
+              CRBODY=$(printf '%s' "$CR" | sed '$d')
+              ERRS=$(printf '%s' "$CRBODY" | jq -c '.errors' 2>/dev/null || printf '%s' "$CRBODY")
+              if [ "$CRCODE" = "200" ]; then created=true; echo "Created '${PROJECT_NAME}'."; break; fi
+              # A concurrent run may have created it first — treat "name taken" as success.
+              if printf '%s' "$CRBODY" | grep -qi 'already exists\|not unique\|8000009'; then
+                created=true; echo "Project '${PROJECT_NAME}' already exists — continuing."; break
+              fi
+              echo "::warning::Create attempt ${attempt}/3 failed (HTTP ${CRCODE}): ${ERRS}. Retrying in 5s..."
+              sleep 5
+            done
+            if [ "$created" != "true" ]; then
+              echo "::error::Couldn't create Cloudflare Pages project '${PROJECT_NAME}' after 3 attempts (last: ${ERRS}). Cloudflare error 8000000 is usually a transient API blip — just re-run this deploy. If it persists: check the token has 'Cloudflare Pages: Edit' and that the account it belongs to matches CLOUDFLARE_ACCOUNT_ID (re-create the token from the Glassdocs 'Connect Cloudflare' deep link to fix both)."
+              exit 1
+            fi
           else
-            echo "::warning::Couldn't verify the Pages project type (HTTP ${CODE}); continuing. If the deploy fails with 'existing projects cannot be upgraded', the project is Git-connected — delete it in the Cloudflare dashboard and redeploy."
+            echo "::warning::Couldn't verify the Pages project (HTTP ${CODE}); continuing. If the deploy fails with 'existing projects cannot be upgraded', the project is Git-connected — delete it in the Cloudflare dashboard and redeploy."
           fi
 
       # ── 4. Deploy the built site to Cloudflare Pages ──

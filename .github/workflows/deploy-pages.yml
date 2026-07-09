@@ -162,6 +162,33 @@ jobs:
       - name: Add security headers
         run: cp _playbook/templates/_headers "$SITE_DIR/_headers"
 
+      # ── 0. Cloudflare credential preflight ──
+      # Report exactly what arrived so an empty/short secret is diagnosable at a
+      # glance (the API otherwise fails with a cryptic "could not route" when the
+      # account id is blank). Token is masked by Actions; we print only its
+      # length. The account id is not a secret, so we verify + echo it, and
+      # confirm the token can actually reach the account before doing anything.
+      - name: Check Cloudflare credentials
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -uo pipefail
+          echo "CLOUDFLARE_API_TOKEN:  present=${CLOUDFLARE_API_TOKEN:+yes}${CLOUDFLARE_API_TOKEN:-NO}  length=${#CLOUDFLARE_API_TOKEN}"
+          echo "CLOUDFLARE_ACCOUNT_ID: present=${CLOUDFLARE_ACCOUNT_ID:+yes}${CLOUDFLARE_ACCOUNT_ID:-NO}  length=${#CLOUDFLARE_ACCOUNT_ID}  value='${CLOUDFLARE_ACCOUNT_ID}'"
+          if [ -z "${CLOUDFLARE_API_TOKEN}" ] || [ -z "${CLOUDFLARE_ACCOUNT_ID}" ]; then
+            echo "::error::Cloudflare credentials are empty in this run. The KB repo needs CLOUDFLARE_API_TOKEN + CLOUDFLARE_ACCOUNT_ID as Actions **secrets** (use 'Connect Cloudflare' in the Glassdocs admin, or set them on the repo). If they ARE set on the repo but still arrive empty here, the reusable workflow isn't inheriting them — check that the caller passes 'secrets: inherit'."
+            exit 1
+          fi
+          # Prove the token reaches the account (verify + Access scope) up front.
+          VER=$(curl -s -o /dev/null -w "%{http_code}" "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/tokens/verify" -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}")
+          ACC=$(curl -s -o /dev/null -w "%{http_code}" "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/access/apps?per_page=1" -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}")
+          echo "token verify → ${VER}   access/apps → ${ACC}   (both 200 expected)"
+          if [ "${ACC}" != "200" ]; then
+            echo "::error::The Cloudflare token can't reach Access on account ${CLOUDFLARE_ACCOUNT_ID} (HTTP ${ACC}). It needs 'Access: Apps and Policies: Edit'. Re-create it from the Glassdocs deep link."
+            exit 1
+          fi
+
       # ── 1. Ensure Cloudflare Access app exists ──
       # On first deploy the Pages project doesn't exist yet, so Access app
       # creation will fail. We record that and create it after deploy instead.

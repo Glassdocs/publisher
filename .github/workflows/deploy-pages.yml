@@ -442,32 +442,38 @@ jobs:
 
           echo "Pages project now exists. Creating Access app for ${DOMAIN}..."
 
-          CREATE_RESPONSE=$(curl -s -X POST "${BASE}/apps" \
-            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
-            -H "Content-Type: application/json" \
-            -d "{
-              \"name\":\"${PROJECT_NAME}\",
-              \"domain\":\"${DOMAIN}\",
-              \"type\":\"self_hosted\",
-              \"session_duration\":\"24h\"
-            }")
-          APP_ID=$(echo "$CREATE_RESPONSE" | jq -r '.result.id // empty')
+          # A brand-new pages.dev domain is NOT immediately eligible for a self-hosted
+          # Access app: Cloudflare returns error 12130 "domain does not belong to zone"
+          # for several minutes after the domain is first provisioned, then starts
+          # accepting the (identical) request. Confirmed empirically: the same POST
+          # failed at +3m and +8m after project creation and succeeded at ~+11m.
+          # So we RETRY on 12130 (and transient 5xx) with backoff, LOGGING every
+          # attempt's error code/message + timestamp — that way a genuinely different
+          # (non-transient) failure is visible in the logs instead of being masked by
+          # a blanket "creation failed". We do NOT tear down the deployment on failure:
+          # the previous rollback couldn't delete an active production deployment
+          # (error 8000034) and only made re-runs restart the clock.
+          APP_ID=""; LAST=""; ATTEMPTS=18   # 18 × 20s ≈ 6 min
+          for i in $(seq 1 "$ATTEMPTS"); do
+            LAST=$(curl -s -X POST "${BASE}/apps" \
+              -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d "{\"name\":\"${PROJECT_NAME}\",\"domain\":\"${DOMAIN}\",\"type\":\"self_hosted\",\"session_duration\":\"24h\"}")
+            APP_ID=$(printf '%s' "$LAST" | jq -r '.result.id // empty')
+            if [ -n "$APP_ID" ]; then echo "Created Access app on attempt ${i}: ${APP_ID}"; break; fi
+            CODE=$(printf '%s' "$LAST" | jq -r '.errors[0].code // empty')
+            MSG=$(printf '%s' "$LAST" | jq -r '.errors[0].message // "unknown"')
+            echo "attempt ${i}/${ATTEMPTS} @ $(date -u +%H:%M:%SZ): code=${CODE} msg=${MSG}"
+            case "$CODE" in
+              12130|1000|10000) : ;;   # domain-not-yet-in-zone / transient — keep retrying
+              *) echo "::error::Access app creation failed with a non-retryable Cloudflare error (code ${CODE}): ${MSG}"; echo "$LAST" >&2; exit 1 ;;
+            esac
+            sleep 20
+          done
 
           if [ -z "$APP_ID" ]; then
-            echo "::error::Failed to create Access app after deploy. Site may be publicly accessible!"
-            echo "$CREATE_RESPONSE" >&2
-
-            # Roll back — delete the deployment since we can't protect it
-            DEPLOYMENTS=$(curl -s \
-              "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/pages/projects/${PROJECT_NAME}/deployments" \
-              -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}")
-            LATEST_ID=$(echo "$DEPLOYMENTS" | jq -r '.result[0].id // empty')
-            if [ -n "$LATEST_ID" ]; then
-              curl -s -X DELETE \
-                "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/pages/projects/${PROJECT_NAME}/deployments/${LATEST_ID}?force=true" \
-                -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}"
-              echo "Rolled back deployment ${LATEST_ID}"
-            fi
+            echo "::error::Couldn't create the Access app for ${DOMAIN} after ${ATTEMPTS} attempts (~6 min); Cloudflare kept returning 'domain does not belong to zone' (12130). A brand-new pages.dev domain can take several minutes to become eligible — the deployment is LEFT IN PLACE, so just re-run this deploy in a few minutes and it will attach Access. Last response below."
+            echo "$LAST" >&2
             exit 1
           fi
 

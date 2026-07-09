@@ -74,6 +74,16 @@ on:
         required: false
         type: string
         default: ""
+      source-repo:
+        description: "MANAGED hosting: owner/name of the KB repo to build. Empty (default) = build the calling repo (client-hosted). When set, SOURCE_TOKEN must grant read access."
+        required: false
+        type: string
+        default: ""
+      source-ref:
+        description: "Git ref to build for source-repo (default: its default branch). Ignored when source-repo is empty."
+        required: false
+        type: string
+        default: ""
     # Declared so callers in ANOTHER organization can pass them explicitly —
     # `secrets: inherit` only forwards within the same org/enterprise, so a
     # cross-org caller (a customer repo calling Glassdocs/publisher) MUST map
@@ -85,6 +95,9 @@ on:
         required: false
       CLOUDFLARE_ACCOUNT_ID:
         description: "Cloudflare account id that owns the Pages project"
+        required: false
+      SOURCE_TOKEN:
+        description: "MANAGED hosting: a token that can read source-repo (e.g. a Glassdocs App installation token). Unused for the client-hosted path."
         required: false
 
 jobs:
@@ -98,7 +111,15 @@ jobs:
       # The built site is always published from ./site (mkdocs default output).
       SITE_DIR: site
     steps:
-      - uses: actions/checkout@v4
+      # Check out the KB source. Client-hosted (default): the caller's own repo.
+      # Managed: the Glassdocs builder sets source-repo + SOURCE_TOKEN so we build
+      # the customer's repo from the Glassdocs org.
+      - name: Check out KB source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.source-repo != '' && inputs.source-repo || github.repository }}
+          ref: ${{ inputs.source-repo != '' && inputs.source-ref || github.ref }}
+          token: ${{ inputs.source-repo != '' && secrets.SOURCE_TOKEN || github.token }}
 
       # Glassdocs is public, so the shared-asset fetch needs no auth. We only
       # need the security-headers template (_headers) and the compliance lint;

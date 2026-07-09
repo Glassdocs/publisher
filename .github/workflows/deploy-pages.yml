@@ -364,16 +364,37 @@ jobs:
             echo "Access is active (HTTP ${HTTP_STATUS})"
           fi
 
-      # ── 3. Ensure Pages project exists (first deploy) ──
-      - name: Ensure Pages project exists
-        if: steps.access.outputs.access_ready == 'false'
+      # ── 3. Ensure the Pages project exists AND is a DIRECT-UPLOAD project ──
+      # Runs every deploy. Creates the project on first deploy, and on every deploy
+      # verifies it isn't a Cloudflare "Connect to Git" project. A Git-connected
+      # project only accepts Cloudflare-side builds, so `wrangler pages deploy`
+      # (what we do) fails on it with the opaque "No migration path exists –
+      # existing projects cannot be upgraded". Detect that here and explain the fix
+      # instead of leaking the raw wrangler error.
+      - name: Ensure Pages project (direct-upload)
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
           set -euo pipefail
-          echo "Creating Pages project ${PROJECT_NAME}..."
-          npx wrangler pages project create "$PROJECT_NAME" --production-branch main 2>&1 || true
+          API="https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/pages/projects/${PROJECT_NAME}"
+          RESP=$(curl -s -w $'\n%{http_code}' "$API" -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}")
+          CODE=$(printf '%s' "$RESP" | tail -n1)
+          BODY=$(printf '%s' "$RESP" | sed '$d')
+          if [ "$CODE" = "200" ]; then
+            SOURCE=$(printf '%s' "$BODY" | jq -r '.result.source.type // empty')
+            if [ -n "$SOURCE" ]; then
+              echo "::error::Cloudflare Pages project '${PROJECT_NAME}' is connected to Git (${SOURCE}) in the Cloudflare dashboard. Glassdocs publishes by DIRECT UPLOAD from GitHub Actions and cannot deploy to a Git-connected project. Fix: Cloudflare dashboard → Workers & Pages → ${PROJECT_NAME} → Settings → Delete project, then redeploy — Glassdocs recreates it correctly. Do NOT use 'Connect to Git' for a Glassdocs KB; publishing is driven entirely from this workflow."
+              exit 1
+            fi
+            echo "Pages project '${PROJECT_NAME}' exists (direct-upload) — OK."
+          elif [ "$CODE" = "404" ]; then
+            echo "Creating direct-upload Pages project '${PROJECT_NAME}'..."
+            npx wrangler pages project create "$PROJECT_NAME" --production-branch main 2>&1 \
+              || echo "::warning::project create returned non-zero (it may already exist from a concurrent run) — continuing to deploy."
+          else
+            echo "::warning::Couldn't verify the Pages project type (HTTP ${CODE}); continuing. If the deploy fails with 'existing projects cannot be upgraded', the project is Git-connected — delete it in the Cloudflare dashboard and redeploy."
+          fi
 
       # ── 4. Deploy the built site to Cloudflare Pages ──
       - name: Deploy to Cloudflare Pages

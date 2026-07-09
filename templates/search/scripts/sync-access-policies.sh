@@ -151,20 +151,31 @@ if [ "$BYPASS_INCLUDES" != "[]" ]; then
 fi
 
 # ── Create allow policy ──
-payload=$(jq -nc \
-  --arg name "$ALLOW_NAME" \
-  --argjson inc "$ALLOW_INCLUDES" \
-  --argjson prec "$ALLOW_PREC" \
-  '{name:$name, decision:"allow", precedence:$prec, include:$inc}')
-echo "Creating allow policy with $(jq 'length' <<<"$ALLOW_INCLUDES") include rule(s)..."
-echo "Payload: $payload"
-resp=$("$CURL" -sS -X POST "${BASE}/apps/${APP_ID}/policies" \
-  -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
-  -H "Content-Type: application/json" \
-  --data "$payload")
-if [ "$(jq -r '.success // false' <<<"$resp")" != "true" ]; then
-  echo "::error::Failed to create allow policy"
-  echo "$resp" >&2
-  exit 1
+# Fail-closed: with zero include rules (EMAIL_DOMAIN / CLIENT_DOMAIN /
+# CLIENT_EMAILS all empty), do NOT create an allow policy. Cloudflare rejects
+# include:[] ("include field should not be empty"), and — more to the point — an
+# Access app with no allow policy is precisely the intended locked state: the
+# domain is gated and nobody is granted in. So skip and report LOCKED rather
+# than fail the deploy.
+if [ "$ALLOW_INCLUDES" = "[]" ]; then
+  echo "::warning::No access rules set (EMAIL_DOMAIN / CLIENT_DOMAIN / CLIENT_EMAILS all empty) — deploying LOCKED. The Access app gates the site and no one is granted access yet; set one of those to grant access."
+  echo "Fail-closed: no allow policy created (site is locked)."
+else
+  payload=$(jq -nc \
+    --arg name "$ALLOW_NAME" \
+    --argjson inc "$ALLOW_INCLUDES" \
+    --argjson prec "$ALLOW_PREC" \
+    '{name:$name, decision:"allow", precedence:$prec, include:$inc}')
+  echo "Creating allow policy with $(jq 'length' <<<"$ALLOW_INCLUDES") include rule(s)..."
+  echo "Payload: $payload"
+  resp=$("$CURL" -sS -X POST "${BASE}/apps/${APP_ID}/policies" \
+    -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+    -H "Content-Type: application/json" \
+    --data "$payload")
+  if [ "$(jq -r '.success // false' <<<"$resp")" != "true" ]; then
+    echo "::error::Failed to create allow policy"
+    echo "$resp" >&2
+    exit 1
+  fi
+  echo "Created allow policy at precedence $ALLOW_PREC ($(jq 'length' <<<"$ALLOW_INCLUDES") include rule(s))"
 fi
-echo "Created allow policy at precedence $ALLOW_PREC ($(jq 'length' <<<"$ALLOW_INCLUDES") include rule(s))"

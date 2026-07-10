@@ -111,6 +111,19 @@ jobs:
       # The built site is always published from ./site (mkdocs default output).
       SITE_DIR: site
     steps:
+      # SECURITY: fail closed on a malformed project name before it reaches any
+      # wrangler `command:` or Cloudflare API JSON body. Pages project names are
+      # [a-z0-9-]; rejecting anything else stops argument/JSON injection when the
+      # name is supplied directly as a repo variable (self-host) rather than via
+      # the server's already-validated setup path.
+      - name: Validate project name
+        run: |
+          case "$PROJECT_NAME" in
+            ""|*[!a-z0-9-]*)
+              echo "::error::Invalid Cloudflare Pages project name '$PROJECT_NAME' — only lowercase letters, digits, and hyphens are allowed."
+              exit 1 ;;
+          esac
+
       # Check out the KB source. Client-hosted (default): the caller's own repo.
       # Managed: the Glassdocs builder sets source-repo + SOURCE_TOKEN so we build
       # the customer's repo from the Glassdocs org.
@@ -331,14 +344,19 @@ jobs:
       # ── 1b. Merge allowed-emails + client-emails ──
       - name: Merge email lists
         id: emails
+        # SECURITY: the email inputs are attacker-influenceable (admin-supplied,
+        # or set directly as CLIENT_EMAILS by anyone with repo write). They reach
+        # the shell ONLY through env vars — never inlined as ${{ }} in run: —
+        # because bash does not re-evaluate a variable's contents, so a crafted
+        # value like `x@e.com"; curl evil #` cannot inject commands into this
+        # runner (which later holds the Cloudflare API token).
+        env:
+          ALLOWED_EMAILS: ${{ inputs.allowed-emails }}
+          CLIENT_EMAILS: ${{ inputs.client-emails }}
         run: |
-          ALL=""
-          [ -n "${{ inputs.allowed-emails }}" ] && ALL="${{ inputs.allowed-emails }}"
-          if [ -n "${{ inputs.client-emails }}" ]; then
-            [ -n "$ALL" ] && ALL="${ALL},"
-            ALL="${ALL}${{ inputs.client-emails }}"
-          fi
-          echo "merged=${ALL}" >> "$GITHUB_OUTPUT"
+          ALL="$ALLOWED_EMAILS"
+          [ -n "$CLIENT_EMAILS" ] && ALL="${ALL:+$ALL,}$CLIENT_EMAILS"
+          echo "merged=$ALL" >> "$GITHUB_OUTPUT"
 
       # ── 1c. Sync managed Access policies (allow + optional bypass) ──
       - name: Sync Access policies

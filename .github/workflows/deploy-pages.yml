@@ -515,6 +515,11 @@ jobs:
 
           echo "Created Access app: $APP_ID"
           echo "app_id=${APP_ID}" >> "$GITHUB_OUTPUT"
+          # Export the REAL subdomain so the post-deploy verify/rollback checks the
+          # domain we actually protected — not the stale name-based domain, which on
+          # a collision belongs to a DIFFERENT account (verifying it would either
+          # green-light an unprotected site or roll back this good deployment).
+          echo "real_domain=${DOMAIN}" >> "$GITHUB_OUTPUT"
 
       - name: Sync Access policies (first deploy)
         if: steps.access.outputs.access_ready == 'false'
@@ -531,7 +536,9 @@ jobs:
       # ── 6. Post-deploy: verify the live site is gated ──
       - name: Post-deploy — verify site is protected
         env:
-          DOMAIN: ${{ steps.access.outputs.domain }}
+          # On a first deploy the access step's domain is name-based; prefer the
+          # real subdomain the first-deploy step resolved after the project existed.
+          DOMAIN: ${{ steps.access-firstdeploy.outputs.real_domain || steps.access.outputs.domain }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |

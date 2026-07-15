@@ -3,8 +3,8 @@
 # docs-lint.sh - Glassdocs Markdown-KB compliance checks.
 #
 # A Glassdocs KB is Markdown: docs/*.md + mkdocs.yml, no custom HTML. The
-# publisher builds it with mkdocs-material (the same config Zensical reads)
-# and deploys the result. This lint enforces that shape before a deploy
+# publisher builds it with Zensical (the MkDocs successor, which reads the
+# KB's mkdocs.yml) and deploys the result. This lint enforces that shape before a deploy
 # runs, so a non-conforming repo fails fast instead of mid-build.
 #
 # Usage (from a repo root):

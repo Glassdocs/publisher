@@ -147,6 +147,7 @@ jobs:
           sparse-checkout: |
             templates/_headers
             templates/search/scripts/docs-lint.sh
+            templates/search/scripts/inject-source-meta.mjs
 
       # Compliance lint on the Markdown source — fails the deploy on violations
       # BEFORE any side effects. Markdown-only rules: a deploy workflow exists,
@@ -218,6 +219,18 @@ jobs:
             exit 1
           fi
           zensical build
+
+      # Inject GlassDocs recognition meta (source-repo / source-path) into the
+      # built HTML so the browser extension recognises this site and maps each
+      # page to its Markdown source. Post-build + build-agnostic on purpose:
+      # Zensical rewrote theming, so mkdocs-material template overrides are a
+      # no-op — the repo identity is a deploy-time fact, injected here where CI
+      # actually knows it. Non-fatal if the repo can't be determined.
+      - name: Inject GlassDocs recognition meta
+        run: |
+          node _playbook/templates/search/scripts/inject-source-meta.mjs \
+            --repo "${{ inputs.source-repo != '' && inputs.source-repo || github.repository }}" \
+            --site "$SITE_DIR" --docs-dir docs
 
       # _headers (security headers + CSP) is a Cloudflare Pages control file and
       # must sit at the site root. It ALWAYS comes from the platform template —

@@ -1,10 +1,10 @@
 # ═══════════════════════════════════════════════════════════════════════
-# Reusable secure-by-default Markdown publisher (mkdocs / Zensical)
+# Reusable secure-by-default Markdown publisher (Zensical)
 #
 # A Glassdocs KB is Markdown, full stop: docs/*.md + mkdocs.yml, no custom
-# HTML. This workflow builds that source with mkdocs-material (which reads
-# the same mkdocs.yml Zensical does) and publishes the built site to
-# Cloudflare Pages, secure by default:
+# HTML. This workflow builds that source with Zensical (the MkDocs successor
+# from the Material team, which reads the KB's mkdocs.yml) and publishes the
+# built site to Cloudflare Pages, secure by default:
 #   1. A Cloudflare Access app + allow policy exist (fail-closed if none match)
 #   2. Site is NOT publicly accessible before deploy (pre-flight)
 #   3. Built site deploys to Cloudflare Pages
@@ -108,7 +108,8 @@ jobs:
       deployments: write
     env:
       PROJECT_NAME: ${{ inputs.project-name }}
-      # The built site is always published from ./site (mkdocs default output).
+      # The built site is always published from ./site (Zensical's default
+      # output dir, the same one mkdocs used).
       SITE_DIR: site
     steps:
       # SECURITY: fail closed on a malformed project name before it reaches any
@@ -173,16 +174,16 @@ jobs:
 
       # setup-python's pip cache keys on a requirements/pyproject file and HARD
       # FAILS if none exists — which is exactly a minimal Markdown KB (mkdocs.yml
-      # + docs/, no Python deps). Materialize the mkdocs-material baseline so the
-      # cache always has a key and builds are reproducible. A repo that ships its
-      # own requirements.txt / docs/requirements.txt / pyproject.toml is left
+      # + docs/, no Python deps). Materialize the Zensical baseline so the cache
+      # always has a key and builds are reproducible. A repo that ships its own
+      # requirements.txt / docs/requirements.txt / pyproject.toml is left
       # untouched and still wins in the install step below.
       - name: Ensure a pip dependency file exists
         run: |
           set -euo pipefail
           if [ ! -f requirements.txt ] && [ ! -f docs/requirements.txt ] && [ ! -f pyproject.toml ]; then
-            echo "mkdocs-material>=9.5,<10" > requirements.txt
-            echo "No pip dependency file in the KB — wrote a baseline requirements.txt (mkdocs-material)."
+            echo "zensical" > requirements.txt
+            echo "No pip dependency file in the KB — wrote a baseline requirements.txt (zensical)."
           fi
 
       - name: Set up Python
@@ -191,20 +192,22 @@ jobs:
           python-version: ${{ inputs.python-version }}
           cache: pip
 
-      # mkdocs-material reads the KB's mkdocs.yml unchanged (the same config
-      # Zensical consumes). A KB may pin extra plugins via requirements.txt or
-      # docs/requirements.txt; we install those on top of the material baseline.
+      # Zensical reads the KB's mkdocs.yml unchanged. A KB may pin Zensical (or
+      # extra plugins) via requirements.txt or docs/requirements.txt; if it ships
+      # neither, install Zensical directly. Mirrors docs-playbook's Zensical build.
       - name: Install site generator
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
-          pip install "mkdocs-material>=9.5,<10"
           if [ -f requirements.txt ]; then
             echo "Installing requirements.txt"
             pip install -r requirements.txt
           elif [ -f docs/requirements.txt ]; then
             echo "Installing docs/requirements.txt"
             pip install -r docs/requirements.txt
+          else
+            echo "No requirements file — installing zensical directly"
+            pip install zensical
           fi
 
       - name: Build site
@@ -214,7 +217,7 @@ jobs:
             echo "::error::No mkdocs.yml at repo root. A Glassdocs KB is Markdown: docs/*.md + mkdocs.yml."
             exit 1
           fi
-          mkdocs build --clean --site-dir "$SITE_DIR"
+          zensical build
 
       # _headers (security headers + CSP) is a Cloudflare Pages control file and
       # must sit at the site root. It ALWAYS comes from the platform template —

@@ -70,8 +70,13 @@ fi
 #    not commerce. Files that bind a dollar amount to a deliverable (rate
 #    cards, pricing, quotes, invoices, contracts, SOWs) belong in the
 #    pre-sales repo where allow-financial is set.
+#
+#    Match the commercial WORD as the filename stem (optionally pluralised or
+#    with a numeric/date suffix like invoice-2024.pdf), NOT any file that merely
+#    starts with it — so ordinary engineering docs (contract-testing.md,
+#    pricing-model-architecture.md, quote-formatting.md) are not false-flagged.
 if [ "$ALLOW_FINANCIAL" != "true" ] && [ -d "$DOCS_DIR" ]; then
-  bad=$(list_under "$DOCS_DIR" | grep -iE '(^|/)(sow|rate-card|pricing|quote|invoice|contract)[^/]*\.(md|pdf|docx)$' || true)
+  bad=$(list_under "$DOCS_DIR" | grep -iE '(^|/)(sow|rate-card|pricing|quote|invoice|contract)s?([-_ ]?[0-9][a-z0-9._-]*)?\.(md|pdf|docx)$' || true)
   if [ -n "$bad" ]; then
     fail "Commercial/contractual files in $DOCS_DIR/: $(echo "$bad" | tr '\n' ' ')"
   fi

@@ -18,7 +18,7 @@
 // on this — the site still ships, the extension's write features just stay off.
 // Idempotent: a re-run replaces its own <!-- @glassdocs-meta --> block.
 
-import { readFileSync, writeFileSync, readdirSync, statSync } from "node:fs";
+import { readFileSync, writeFileSync, readdirSync, statSync, existsSync } from "node:fs";
 import path from "node:path";
 
 const START = "<!-- @glassdocs-meta -->";
@@ -51,14 +51,22 @@ function htmlFiles(dir) {
 
 // Reverse the generator's directory-URL mapping to the Markdown source:
 //   site/index.html        -> docs/index.md
-//   site/foo/index.html    -> docs/foo.md
-//   site/a/b/index.html    -> docs/a/b.md
+//   site/foo/index.html    -> docs/foo.md  OR  docs/foo/index.md (section landing)
+//   site/a/b/index.html    -> docs/a/b.md  OR  docs/a/b/index.md
 //   site/404.html (non-index) -> null (no clean source; source-repo only)
-export function sourcePathFor(file, siteDir, docsDir) {
+//
+// `site/foo/index.html` is ambiguous: MkDocs/Zensical produce it from EITHER
+// `docs/foo.md` OR the common section-landing file `docs/foo/index.md`. Guessing
+// wrong makes "edit this page" target a file that doesn't exist and, on commit,
+// create a stray one. The build ran in the checked-out repo, so `docs/` is on
+// disk — prefer whichever source actually exists (injectable for tests).
+export function sourcePathFor(file, siteDir, docsDir, exists = existsSync) {
   const rel = path.relative(siteDir, file).split(path.sep).join("/");
   if (rel === "index.html") return `${docsDir}/index.md`;
   const m = rel.match(/^(.+)\/index\.html$/);
-  return m ? `${docsDir}/${m[1]}.md` : null;
+  if (!m) return null;
+  const sectionIndex = `${docsDir}/${m[1]}/index.md`;
+  return exists(sectionIndex) ? sectionIndex : `${docsDir}/${m[1]}.md`;
 }
 
 // Insert (or replace) the meta block just before </head>. Returns the new HTML,

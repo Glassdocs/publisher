@@ -485,6 +485,13 @@ jobs:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           wranglerVersion: ${{ inputs.wrangler-version || '' }}
+          # Force npm (always on the runner). Without this, wrangler-action infers
+          # the package manager from a lockfile in the KB repo — so a repo that
+          # carries a pnpm-lock.yaml / yarn.lock (e.g. an app repo published as a
+          # KB) makes it try pnpm/yarn, which isn't installed → "Unable to locate
+          # executable file: pnpm". The KB's own lockfile is irrelevant to running
+          # wrangler; pin npm so ANY repo deploys.
+          packageManager: npm
           command: pages deploy ${{ env.SITE_DIR }} --project-name=${{ inputs.project-name }}
 
       # ── 5. First deploy: create Access app now that Pages project exists ──

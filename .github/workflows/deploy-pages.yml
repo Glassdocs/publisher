@@ -12,6 +12,13 @@
 #   5. Site is NOT publicly accessible after deploy (post-deploy)
 #   6. If the post-deploy check fails, the deployment is rolled back (deleted)
 #
+# PUBLIC MODE (explicit opt-in, `public: true`): for documentation meant for
+# the whole world (e.g. a product's public docs). No Access app is created —
+# and one already gating the domain is REMOVED, since public is the declared
+# intent — and the post-deploy check inverts: the site must be reachable
+# (HTTP 200). Everything else (lint, build, headers) is unchanged. The
+# default remains false: a KB never becomes public by omission.
+#
 # Usage in a consumer KB repo (.github/workflows/deploy.yml):
 #   jobs:
 #     deploy:
@@ -54,6 +61,11 @@ on:
         required: false
         type: string
         default: ""
+      public:
+        description: "Publish this KB fully PUBLIC — no Cloudflare Access gate (an existing gate on the domain is removed). Explicit opt-in for world-readable docs; default false keeps the secure-by-default posture."
+        required: false
+        type: boolean
+        default: false
       allow-financial:
         description: "Allow financial/contractual content in docs/ (only for pre-sales KBs)"
         required: false
@@ -256,6 +268,7 @@ jobs:
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          PUBLIC_MODE: ${{ inputs.public }}
         run: |
           set -uo pipefail
           echo "CLOUDFLARE_API_TOKEN:  present=${CLOUDFLARE_API_TOKEN:+yes}${CLOUDFLARE_API_TOKEN:-NO}  length=${#CLOUDFLARE_API_TOKEN}"
@@ -265,12 +278,18 @@ jobs:
             exit 1
           fi
           # Prove the token reaches the account (verify + Access scope) up front.
+          # A PUBLIC KB never touches Access APIs beyond the best-effort gate
+          # removal, so a missing Access scope is only fatal for gated KBs.
           VER=$(curl -s -o /dev/null -w "%{http_code}" "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/tokens/verify" -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}")
           ACC=$(curl -s -o /dev/null -w "%{http_code}" "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/access/apps?per_page=1" -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}")
-          echo "token verify → ${VER}   access/apps → ${ACC}   (both 200 expected)"
+          echo "token verify → ${VER}   access/apps → ${ACC}"
           if [ "${ACC}" != "200" ]; then
-            echo "::error::The Cloudflare token can't reach Access on account ${CLOUDFLARE_ACCOUNT_ID} (HTTP ${ACC}). It needs 'Access: Apps and Policies: Edit'. Re-create it from the Glassdocs deep link."
-            exit 1
+            if [ "${PUBLIC_MODE}" = "true" ]; then
+              echo "::warning::The Cloudflare token can't reach Access (HTTP ${ACC}). Fine for a public KB — but if a leftover Access gate exists on this domain, it can't be removed automatically."
+            else
+              echo "::error::The Cloudflare token can't reach Access on account ${CLOUDFLARE_ACCOUNT_ID} (HTTP ${ACC}). It needs 'Access: Apps and Policies: Edit'. Re-create it from the Glassdocs deep link."
+              exit 1
+            fi
           fi
 
       # ── 1. Ensure Cloudflare Access app exists ──
@@ -278,6 +297,7 @@ jobs:
       # creation will fail. We record that and create it after deploy instead.
       - name: Ensure Cloudflare Access app
         id: access
+        if: ${{ !inputs.public }}
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
@@ -364,6 +384,61 @@ jobs:
               fi
             fi
           fi
+
+      # ── 1a-public. Public mode: resolve domain, remove any leftover gate ──
+      # `public: true` is the caller's explicit declaration that this KB is
+      # world-readable. An Access app already gating the domain (e.g. the KB
+      # used to be private) would silently defeat that, so it is deleted —
+      # loudly. Best-effort: without the Access scope on the token we can only
+      # warn (the post-deploy reachability check below still catches a site
+      # that stayed gated).
+      - name: Public mode — resolve domain, drop any Access gate
+        id: public-mode
+        if: ${{ inputs.public }}
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          echo "::notice::PUBLIC MODE — this KB deploys with NO Cloudflare Access gate (explicit 'public: true')."
+          PROJ_JSON=$(curl -s "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/pages/projects/${PROJECT_NAME}" \
+            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}")
+          DOMAIN=$(printf '%s' "$PROJ_JSON" | jq -r '.result.subdomain // empty')
+          if [ -z "$DOMAIN" ]; then
+            DOMAIN="${PROJECT_NAME}.pages.dev"
+            echo "Project not created yet — using name-based domain ${DOMAIN} for now."
+          fi
+          echo "domain=${DOMAIN}" >> "$GITHUB_OUTPUT"
+
+          BASE="https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/access"
+          PAGE=1
+          while true; do
+            LIST_RESPONSE=$(curl -s "${BASE}/apps?page=${PAGE}&per_page=50" \
+              -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}")
+            if [ "$(echo "$LIST_RESPONSE" | jq -r '.success // false')" != "true" ]; then
+              echo "::warning::Couldn't list Access apps (token may lack the Access scope) — skipping gate removal. If the site stays gated, remove the Access app for ${DOMAIN} manually."
+              break
+            fi
+            MATCH=$(echo "$LIST_RESPONSE" | \
+              jq -r --arg d "$DOMAIN" \
+                '(.result // [])[] | select(.self_hosted_domains[]? == $d or .domain == $d) | .id' | head -1)
+            if [ -n "$MATCH" ]; then
+              echo "::warning::Removing existing Access app ${MATCH} gating ${DOMAIN} — this KB is now PUBLIC by explicit opt-in."
+              DEL=$(curl -s -X DELETE "${BASE}/apps/${MATCH}" \
+                -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}")
+              if [ "$(echo "$DEL" | jq -r '.success // false')" != "true" ]; then
+                echo "::warning::Failed to delete Access app ${MATCH}: $(echo "$DEL" | jq -r '.errors[0].message // "unknown"'). The post-deploy check will fail if the site stays gated."
+              fi
+              break
+            fi
+            TOTAL_PAGES=$(echo "$LIST_RESPONSE" | jq -r '.result_info.total_pages // 1')
+            COUNT=$(echo "$LIST_RESPONSE" | jq -r '(.result // []) | length')
+            if [ "$PAGE" -ge "$TOTAL_PAGES" ] || [ "$COUNT" = "0" ]; then
+              echo "No Access app gates ${DOMAIN} — nothing to remove."
+              break
+            fi
+            PAGE=$((PAGE + 1))
+          done
 
       # ── 1b. Merge allowed-emails + client-emails ──
       - name: Merge email lists
@@ -572,7 +647,7 @@ jobs:
       # ungated site live. Gated on the deploy step so a build/deploy failure
       # (nothing new published) doesn't trigger a rollback of a prior good deploy.
       - name: Post-deploy — verify site is protected
-        if: ${{ !cancelled() && steps.deploy.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.deploy.outcome == 'success' && !inputs.public }}
         env:
           # On a first deploy the access step's domain is name-based; prefer the
           # real subdomain the first-deploy step resolved after the project existed.
@@ -615,4 +690,42 @@ jobs:
               -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}"
             echo "Rolled back deployment ${LATEST_ID}."
           fi
+          exit 1
+
+      # ── 6-public. Post-deploy: verify the PUBLIC site is actually live ──
+      # The inverse of the gated check: a public KB must answer an
+      # unauthenticated request with content (HTTP 200). A redirect here means
+      # an Access gate is still up (removal failed or propagation lag); fail
+      # loudly — but do NOT roll back, since a still-gated site is the safe
+      # direction of failure for a public KB.
+      - name: Post-deploy — verify public site is live
+        if: ${{ !cancelled() && steps.deploy.outcome == 'success' && inputs.public }}
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          # Re-resolve the REAL subdomain now that the project certainly exists
+          # (on a first deploy the pre-deploy step only had the name-based guess).
+          DOMAIN=$(curl -s "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/pages/projects/${PROJECT_NAME}" \
+            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" | jq -r '.result.subdomain // empty')
+          [ -z "$DOMAIN" ] && DOMAIN="${PROJECT_NAME}.pages.dev"
+          echo "Waiting for deployment to propagate..."
+          sleep 15
+          STATUS="000"
+          for attempt in 1 2 3 4; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 15 "https://${DOMAIN}" || echo "000")
+            echo "verify attempt ${attempt}/4: https://${DOMAIN} -> HTTP ${STATUS}"
+            if [ "$STATUS" = "200" ]; then
+              echo "Public site is live: https://${DOMAIN}"
+              exit 0
+            fi
+            sleep 10
+          done
+          case "$STATUS" in
+            301|302|303|307|308)
+              echo "::error::https://${DOMAIN} still redirects (HTTP ${STATUS}) — an Access gate is still up despite 'public: true'. Remove the Access app for ${DOMAIN} in Cloudflare Zero Trust and re-run. Deployment left in place (gated is the safe failure direction)." ;;
+            *)
+              echo "::error::https://${DOMAIN} is not serving content (last HTTP ${STATUS}). Deployment left in place — re-run once resolved." ;;
+          esac
           exit 1

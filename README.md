@@ -27,6 +27,20 @@ jobs:
 Pin by tag (`@v1`) — the workflow runs across every consumer repo, so it is a
 release-gated artifact.
 
+### Public KBs (explicit opt-in)
+
+For world-readable documentation (e.g. a product's public docs), pass
+`public: true`. No Cloudflare Access app is created — and one already gating
+the domain is removed, since public is the declared intent — and the
+post-deploy check inverts to "the site must serve content (HTTP 200)".
+The default is `false`: a KB never becomes public by omission.
+
+```yaml
+    with:
+      project-name: ${{ vars.CF_PAGES_PROJECT }}
+      public: true
+```
+
 ## What's here
 
 - `.github/workflows/deploy-pages.yml` — the reusable publisher

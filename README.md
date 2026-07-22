@@ -45,8 +45,8 @@ The default is `false`: a KB never becomes public by omission.
 
 - `.github/workflows/deploy-pages.yml` — the reusable publisher
 - `.github/actions/sync-access-policies/` — Cloudflare Access policy reconciler
-- `templates/`, `docs/styles.css`, `brand/assets/` — shared build scripts + brand
-  assets the workflow fetches at deploy time
+- `templates/` — the security-headers file (`_headers`) and the compliance-lint /
+  meta-injection scripts the workflow fetches at deploy time
 
 Source of truth is the (private) `Glassdocs/glassdocs` monorepo; this repo is the
 public, tag-pinned distribution of the publisher.

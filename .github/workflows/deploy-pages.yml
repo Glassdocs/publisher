@@ -137,14 +137,36 @@ jobs:
               exit 1 ;;
           esac
 
+      # Managed hosting needs a token that can read source-repo. Fail with a
+      # clear message here rather than letting checkout fall back to
+      # github.token and die with a confusing "repository not found".
+      - name: Check managed-hosting source token
+        if: ${{ inputs.source-repo != '' }}
+        env:
+          SOURCE_TOKEN: ${{ secrets.SOURCE_TOKEN }}
+          # Env-indirection, not inline ${{ }}: source-repo is an unvalidated
+          # workflow_call input (see the injection note on the meta step below).
+          SOURCE_REPO: ${{ inputs.source-repo }}
+        run: |
+          if [ -z "$SOURCE_TOKEN" ]; then
+            echo "::error::SOURCE_TOKEN missing — source-repo is set ('${SOURCE_REPO}') but the SOURCE_TOKEN secret is empty, so the customer repo cannot be checked out. Pass a token that can read that repo to the reusable workflow."
+            exit 1
+          fi
+
       # Check out the KB source. Client-hosted (default): the caller's own repo.
       # Managed: the Glassdocs builder sets source-repo + SOURCE_TOKEN so we build
       # the customer's repo from the Glassdocs org.
+      #
+      # ref: with source-repo set, use source-ref as given — INCLUDING when it is
+      # empty, which makes actions/checkout use that repo's default branch. The
+      # old `source-repo != '' && source-ref || github.ref` ternary collapsed an
+      # empty source-ref into the CALLER's github.ref, sending a ref from one
+      # repo into a different (customer) repo.
       - name: Check out KB source
         uses: actions/checkout@v4
         with:
           repository: ${{ inputs.source-repo != '' && inputs.source-repo || github.repository }}
-          ref: ${{ inputs.source-repo != '' && inputs.source-ref || github.ref }}
+          ref: ${{ inputs.source-repo == '' && github.ref || inputs.source-ref }}
           token: ${{ inputs.source-repo != '' && secrets.SOURCE_TOKEN || github.token }}
 
       # Glassdocs is public, so the shared-asset fetch needs no auth. We only
@@ -477,10 +499,22 @@ jobs:
           DOMAIN: ${{ steps.access.outputs.domain }}
         run: |
           set -euo pipefail
-          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
-            --max-time 15 "https://${DOMAIN}" 2>/dev/null || echo "000")
-
-          echo "Pre-flight: https://${DOMAIN} returned HTTP ${HTTP_STATUS}"
+          # A 200 may be Access-policy propagation lag rather than a truly open
+          # site — retry like the post-deploy check does, and only conclude
+          # BLOCKED if the FINAL attempt still serves content.
+          HTTP_STATUS="000"
+          for attempt in 1 2 3 4; do
+            HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+              --max-time 15 "https://${DOMAIN}" 2>/dev/null || echo "000")
+            echo "Pre-flight attempt ${attempt}/4: https://${DOMAIN} returned HTTP ${HTTP_STATUS}"
+            if [ "$HTTP_STATUS" != "200" ]; then
+              break
+            fi
+            if [ "$attempt" -lt 4 ]; then
+              echo "Got 200 — could be Access propagation lag; retrying in 10s..."
+              sleep 10
+            fi
+          done
 
           if [ "$HTTP_STATUS" = "200" ]; then
             echo "::error::BLOCKED — site is publicly accessible BEFORE deploy. Access is not active."
@@ -589,6 +623,13 @@ jobs:
           REAL=$(curl -s "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/pages/projects/${PROJECT_NAME}" \
             -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" | jq -r '.result.subdomain // empty')
           [ -n "$REAL" ] && DOMAIN="$REAL"
+          # Export the REAL subdomain IMMEDIATELY — before any create attempt —
+          # so the post-deploy verify/rollback probes the domain the site is
+          # actually served at even when Access-app creation fails below. The
+          # stale name-based domain, on a collision, belongs to a DIFFERENT
+          # account (verifying it would either green-light an unprotected site
+          # or roll back this good deployment).
+          echo "real_domain=${DOMAIN}" >> "$GITHUB_OUTPUT"
           echo "Pages project now exists. Creating Access app for ${DOMAIN}..."
 
           # Create with a SHORT retry for genuine transient 5xx only. 12130
@@ -622,11 +663,6 @@ jobs:
 
           echo "Created Access app: $APP_ID"
           echo "app_id=${APP_ID}" >> "$GITHUB_OUTPUT"
-          # Export the REAL subdomain so the post-deploy verify/rollback checks the
-          # domain we actually protected — not the stale name-based domain, which on
-          # a collision belongs to a DIFFERENT account (verifying it would either
-          # green-light an unprotected site or roll back this good deployment).
-          echo "real_domain=${DOMAIN}" >> "$GITHUB_OUTPUT"
 
       - name: Sync Access policies (first deploy)
         if: steps.access.outputs.access_ready == 'false'
@@ -685,10 +721,16 @@ jobs:
             -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}")
           LATEST_ID=$(echo "$DEPLOYMENTS" | jq -r '.result[0].id // empty')
           if [ -n "$LATEST_ID" ]; then
-            curl -s -X DELETE \
+            DEL=$(curl -s -X DELETE \
               "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/pages/projects/${PROJECT_NAME}/deployments/${LATEST_ID}?force=true" \
-              -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}"
-            echo "Rolled back deployment ${LATEST_ID}."
+              -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" || true)
+            if [ "$(echo "$DEL" | jq -r '.success // false' 2>/dev/null)" = "true" ]; then
+              echo "Rolled back deployment ${LATEST_ID}."
+            else
+              echo "::error::ROLLBACK FAILED — deployment ${LATEST_ID} may still be exposed; delete it manually (Cloudflare dashboard → Workers & Pages → ${PROJECT_NAME} → deployments). Delete response: $(echo "$DEL" | jq -c '.errors // .' 2>/dev/null || echo "$DEL")"
+            fi
+          else
+            echo "::error::ROLLBACK FAILED — couldn't identify the latest deployment; it may still be exposed. Verify and delete it manually (Cloudflare dashboard → Workers & Pages → ${PROJECT_NAME} → deployments)."
           fi
           exit 1
 

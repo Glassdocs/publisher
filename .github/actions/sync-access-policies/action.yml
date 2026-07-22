@@ -8,8 +8,10 @@ description: |
                  + optional explicit client emails
   With no includes the allow policy matches nobody (fail-closed).
 
-  All pre-existing policies on the app are deleted before recreation, so the
-  live state always matches the inputs.
+  Lockout-safe ordering: inputs are validated before any mutation, the new
+  policies are created first, and only after every create succeeds are the
+  pre-existing policies deleted — so the live state matches the inputs and a
+  working KB is never left with zero policies.
 
   Shell logic lives in templates/search/scripts/sync-access-policies.sh so it
   can be unit-tested locally.

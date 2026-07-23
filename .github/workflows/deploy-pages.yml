@@ -315,6 +315,10 @@ jobs:
           fi
 
       # ── 1. Ensure Cloudflare Access app exists ──
+      # The app covers the apex AND `*.<domain>` — direct-upload never creates
+      # preview deployments, but anyone holding the Pages token could; the
+      # wildcard means such a preview URL (hash.<name>.pages.dev) is gated too
+      # instead of bypassing the apex-only app (publisher#3).
       # On first deploy the Pages project doesn't exist yet, so Access app
       # creation will fail. We record that and create it after deploy instead.
       - name: Ensure Cloudflare Access app
@@ -386,6 +390,7 @@ jobs:
               -d "{
                 \"name\":\"${PROJECT_NAME}\",
                 \"domain\":\"${DOMAIN}\",
+                \"self_hosted_domains\":[\"${DOMAIN}\",\"*.${DOMAIN}\"],
                 \"type\":\"self_hosted\",
                 \"session_duration\":\"24h\"
               }")
@@ -642,7 +647,7 @@ jobs:
             LAST=$(curl -s -X POST "${BASE}/apps" \
               -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
               -H "Content-Type: application/json" \
-              -d "{\"name\":\"${PROJECT_NAME}\",\"domain\":\"${DOMAIN}\",\"type\":\"self_hosted\",\"session_duration\":\"24h\"}")
+              -d "{\"name\":\"${PROJECT_NAME}\",\"domain\":\"${DOMAIN}\",\"self_hosted_domains\":[\"${DOMAIN}\",\"*.${DOMAIN}\"],\"type\":\"self_hosted\",\"session_duration\":\"24h\"}")
             APP_ID=$(printf '%s' "$LAST" | jq -r '.result.id // empty')
             if [ -n "$APP_ID" ]; then echo "Created Access app on attempt ${attempt}: ${APP_ID}"; break; fi
             CODE=$(printf '%s' "$LAST" | jq -r '.errors[0].code // empty')

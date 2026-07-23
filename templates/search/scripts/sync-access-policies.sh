@@ -78,14 +78,28 @@ if [ -n "$OFFICE_CIDRS" ]; then
   for c in "${_cidrs[@]}"; do
     c_trim=$(trim "$c")
     [ -z "$c_trim" ] && continue
-    if [[ ! "$c_trim" =~ ^[0-9.]+/[0-9]+$ ]]; then
-      echo "::error::Invalid CIDR in OFFICE_CIDRS: '${c_trim}' (expected a.b.c.d/prefix). No policies were changed."
-      exit 1
+    # Both address families: Cloudflare Access ip includes accept IPv4 and
+    # IPv6 CIDRs (and bare IPs), and IPv6 office ranges predate this check —
+    # rejecting them would hard-fail every deploy for those tenants.
+    if [[ "$c_trim" == *:* ]]; then
+      if [[ ! "$c_trim" =~ ^[0-9A-Fa-f:]+(/[0-9]+)?$ ]]; then
+        echo "::error::Invalid CIDR in OFFICE_CIDRS: '${c_trim}' (expected an IPv6 CIDR like 2001:db8::/32). No policies were changed."
+        exit 1
+      fi
+      _max=128
+    else
+      if [[ ! "$c_trim" =~ ^[0-9.]+(/[0-9]+)?$ ]]; then
+        echo "::error::Invalid CIDR in OFFICE_CIDRS: '${c_trim}' (expected a.b.c.d/prefix). No policies were changed."
+        exit 1
+      fi
+      _max=32
     fi
-    _prefix="${c_trim##*/}"
-    if [ "$((10#$_prefix))" -gt 32 ]; then
-      echo "::error::Invalid CIDR prefix in OFFICE_CIDRS: '${c_trim}' (prefix must be 0-32). No policies were changed."
-      exit 1
+    if [[ "$c_trim" == */* ]]; then
+      _prefix="${c_trim##*/}"
+      if [ "$((10#$_prefix))" -gt "$_max" ]; then
+        echo "::error::Invalid CIDR prefix in OFFICE_CIDRS: '${c_trim}' (prefix must be 0-${_max}). No policies were changed."
+        exit 1
+      fi
     fi
     VALID_CIDRS+=("$c_trim")
   done

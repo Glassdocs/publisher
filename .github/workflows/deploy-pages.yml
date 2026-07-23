@@ -649,14 +649,14 @@ jobs:
             MSG=$(printf '%s' "$LAST" | jq -r '.errors[0].message // "unknown"')
             echo "attempt ${attempt}/3 @ $(date -u +%H:%M:%SZ): code=${CODE} msg=${MSG}"
             if [ "$CODE" = "12130" ]; then
-              echo "::error::Cloudflare says ${DOMAIN} does not belong to this account (Access error 12130). The site deployed here, but this account doesn't own that pages.dev domain — usually a global name collision (the plain <name>.pages.dev is taken by another account, so this project got a suffixed domain) or the KB is wired to the wrong Cloudflare account. Fix: delete this Pages project and redeploy once the plain name is free, or reconnect the KB to the account that owns the domain. The deployment is left in place."
+              echo "::error::Cloudflare says ${DOMAIN} does not belong to this account (Access error 12130). The site deployed here, but this account doesn't own that pages.dev domain — usually a global name collision (the plain <name>.pages.dev is taken by another account, so this project got a suffixed domain) or the KB is wired to the wrong Cloudflare account. Fix: delete this Pages project and redeploy once the plain name is free, or reconnect the KB to the account that owns the domain. The post-deploy check will now verify the gate on the real domain and roll this deployment back if it is exposed."
               echo "$LAST" >&2; exit 1
             fi
             sleep 8
           done
 
           if [ -z "$APP_ID" ]; then
-            echo "::error::Couldn't create the Access app for ${DOMAIN} after 3 attempts. Last response below. The deployment is left in place; re-run once resolved."
+            echo "::error::Couldn't create the Access app for ${DOMAIN} after 3 attempts. Last response below. The post-deploy check will now verify the gate and roll this deployment back if it is exposed; re-run once resolved."
             echo "$LAST" >&2
             exit 1
           fi

@@ -364,7 +364,7 @@ jobs:
             fi
             MATCH=$(echo "$LIST_RESPONSE" | \
               jq -r --arg d "$DOMAIN" \
-                '(.result // [])[] | select(.self_hosted_domains[]? == $d or .domain == $d) | .id' | head -1)
+                '(.result // [])[] | select(((.self_hosted_domains // []) | index($d)) or ((.destinations // []) | map(.uri) | index($d)) or (.domain == $d)) | .id' | head -1)
             if [ -n "$MATCH" ]; then
               APP_ID="$MATCH"
               break
@@ -380,6 +380,26 @@ jobs:
 
           if [ -n "$APP_ID" ]; then
             echo "Found existing Access app: $APP_ID"
+            # Back-fill the preview wildcard onto apps created before it was
+            # added to the create payload — otherwise every pre-existing KB
+            # keeps the `hash.<name>.pages.dev` bypass open. PUT (not PATCH:
+            # API tokens get 10405 on PATCH) and it preserves attached
+            # policies. Non-fatal: the apex gate is already up.
+            APP_JSON=$(printf '%s' "$LIST_RESPONSE" | jq -c --arg id "$APP_ID" 'first((.result // [])[] | select(.id == $id))')
+            HAS_WILDCARD=$(printf '%s' "$APP_JSON" | jq -r --arg w "*.${DOMAIN}" \
+              'if (((.self_hosted_domains // []) | index($w)) or ((.destinations // []) | map(.uri) | index($w))) then "yes" else "" end')
+            if [ -z "$HAS_WILDCARD" ]; then
+              PUT_BODY=$(printf '%s' "$APP_JSON" | jq -c --arg w "*.${DOMAIN}" \
+                '{name, domain, type, session_duration, self_hosted_domains: ((.self_hosted_domains // [.domain]) + [$w])} | with_entries(select(.value != null))')
+              PUT_RESP=$(curl -s -X PUT "${BASE}/apps/${APP_ID}" \
+                -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+                -H "Content-Type: application/json" -d "$PUT_BODY")
+              if [ "$(printf '%s' "$PUT_RESP" | jq -r '.success // false')" = "true" ]; then
+                echo "Back-filled *.${DOMAIN} onto Access app ${APP_ID} (preview URLs now gated)."
+              else
+                echo "::warning::Couldn't add *.${DOMAIN} to Access app ${APP_ID}: $(printf '%s' "$PUT_RESP" | jq -rc '.errors // .'). Preview URLs may be ungated."
+              fi
+            fi
             echo "app_id=${APP_ID}" >> "$GITHUB_OUTPUT"
             echo "access_ready=true" >> "$GITHUB_OUTPUT"
           else
@@ -448,7 +468,7 @@ jobs:
             fi
             MATCH=$(echo "$LIST_RESPONSE" | \
               jq -r --arg d "$DOMAIN" \
-                '(.result // [])[] | select(.self_hosted_domains[]? == $d or .domain == $d) | .id' | head -1)
+                '(.result // [])[] | select(((.self_hosted_domains // []) | index($d)) or ((.destinations // []) | map(.uri) | index($d)) or (.domain == $d)) | .id' | head -1)
             if [ -n "$MATCH" ]; then
               echo "::warning::Removing existing Access app ${MATCH} gating ${DOMAIN} — this KB is now PUBLIC by explicit opt-in."
               DEL=$(curl -s -X DELETE "${BASE}/apps/${MATCH}" \

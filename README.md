@@ -47,6 +47,26 @@ The default is `false`: a KB never becomes public by omission.
 - `.github/actions/sync-access-policies/` — Cloudflare Access policy reconciler
 - `templates/` — the security-headers file (`_headers`) and the compliance-lint /
   meta-injection scripts the workflow fetches at deploy time
+- `tests/` — the unit suite (see below)
+
+## Tests
+
+```sh
+node --test tests/*.test.mjs      # needs node >= 20 and jq; no npm install
+```
+
+Zero dependencies: `node:test` drives the shell scripts directly with a scripted
+mock `curl` on `PATH` (`tests/helpers/mock-curl.mjs`), which records every
+request so a test can assert the exact call **sequence**, not just the outcome —
+the access-policy bugs this suite guards against were ordering bugs. Nothing
+touches the network or a real Cloudflare account.
+
+Covered: the create-before-delete ordering that stops a failed sync from leaving
+a KB with zero Access policies, up-front CIDR/email validation, the IPv4/IPv6
+CIDR matrix, policy pagination, fail-closed behaviour, the docs lint's
+hard-fail-vs-warn split, source-meta injection, and the Access-app matcher jq
+used in `deploy-pages.yml` (tested via verbatim copies in `tests/fixtures/*.jq`,
+kept in sync by drift guards — see the header of `tests/fixtures/find-access-app.jq`).
 
 Source of truth is the (private) `Glassdocs/glassdocs` monorepo; this repo is the
 public, tag-pinned distribution of the publisher.

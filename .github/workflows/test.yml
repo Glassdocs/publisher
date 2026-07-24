@@ -1,0 +1,85 @@
+# ═══════════════════════════════════════════════════════════════════════
+# Tests for the publisher itself.
+#
+# This repo decides whether customer KBs are gated or world-readable, so its
+# scripts are unit-tested against a mock Cloudflare API (tests/helpers/) before
+# anything reaches the v1 tag that consumers deploy from.
+#
+# Hermetic by construction: the suite puts a scripted `curl` on PATH and never
+# talks to a real network, so no secrets are needed and forked PRs run it too.
+# ═══════════════════════════════════════════════════════════════════════
+
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      # The suite is dependency-free (node:test + node:assert), so there is
+      # nothing to install — and no lockfile to keep honest.
+      - name: Run the harness
+        run: node --test tests/*.test.mjs
+
+  lint:
+    name: Static checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      # A syntax error in a template script is a broken deploy for every KB on
+      # the v1 tag, so parse them here even though the unit tests execute them.
+      - name: bash -n (parse every shell script)
+        run: |
+          set -euo pipefail
+          found=0
+          while IFS= read -r f; do
+            echo "bash -n $f"
+            bash -n "$f"
+            found=$((found + 1))
+          done < <(git ls-files '*.sh')
+          if [ "$found" -eq 0 ]; then
+            echo "::error::No shell scripts found to check — the glob or the layout changed."
+            exit 1
+          fi
+
+      - name: node --check (parse every ES module)
+        run: |
+          set -euo pipefail
+          while IFS= read -r f; do
+            echo "node --check $f"
+            node --check "$f"
+          done < <(git ls-files '*.mjs')
+
+      - name: shellcheck
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          git ls-files '*.sh' | xargs shellcheck
+
+      # Pinned to a release rather than tracking main: this script is fetched
+      # and executed, so the version it installs should not change under us.
+      - name: actionlint
+        run: |
+          set -euo pipefail
+          bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.12/scripts/download-actionlint.bash) 1.7.12
+          ./actionlint -color

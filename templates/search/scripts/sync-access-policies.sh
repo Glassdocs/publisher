@@ -46,6 +46,20 @@ BASE="https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/acc
 ALLOW_NAME="Allow staff + clients"
 BYPASS_NAME="Office network bypass"
 
+# Split a comma-separated list into an array, tolerating newlines.
+# `read` stops at the first newline no matter what IFS says, so a value pasted
+# one-per-line into a repo variable (OFFICE_CIDRS) or passed as a YAML block
+# scalar silently lost everything after line 1 — and a value that STARTED with a
+# newline produced zero items, which for CLIENT_EMAILS meant an empty allow
+# policy: the KB deployed LOCKED and every old policy was deleted. Normalise
+# newlines to separators first so the whole list survives.
+split_list() {
+  local raw=$1
+  raw="${raw//$'\r'/,}"
+  raw="${raw//$'\n'/,}"
+  IFS=',' read -ra _split_out <<< "$raw"
+}
+
 # Quote-safe whitespace trim. NOT xargs: xargs interprets quotes/backslashes,
 # so an item containing them gets mangled (or kills the command outright).
 trim() {
@@ -60,8 +74,8 @@ trim() {
 # create — after the old policies were already deleted, locking everyone out.
 VALID_EMAILS=()
 if [ -n "$CLIENT_EMAILS" ]; then
-  IFS=',' read -ra _emails <<< "$CLIENT_EMAILS"
-  for e in "${_emails[@]}"; do
+  split_list "$CLIENT_EMAILS"
+  for e in "${_split_out[@]}"; do
     e_trim=$(trim "$e")
     [ -z "$e_trim" ] && continue
     if [[ ! "$e_trim" =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]]; then
@@ -74,8 +88,8 @@ fi
 
 VALID_CIDRS=()
 if [ -n "$OFFICE_CIDRS" ]; then
-  IFS=',' read -ra _cidrs <<< "$OFFICE_CIDRS"
-  for c in "${_cidrs[@]}"; do
+  split_list "$OFFICE_CIDRS"
+  for c in "${_split_out[@]}"; do
     c_trim=$(trim "$c")
     [ -z "$c_trim" ] && continue
     # Both address families: Cloudflare Access ip includes accept IPv4 and

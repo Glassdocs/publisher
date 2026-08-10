@@ -2,7 +2,9 @@
 
 The **public** reusable GitHub Actions workflow that publishes a Glassdocs
 knowledge base to Cloudflare Pages, secure-by-default (Cloudflare Access enforced,
-fail-closed, preview deploys disabled, verify-or-rollback).
+fail-closed, preview URLs gated by the same Access app, and a post-deploy check
+that only reports success on a proven gate — and only undoes a deploy on proven
+exposure).
 
 It must be public so KB repos in **any** org can call it — a private reusable
 workflow can't be used across organizations.

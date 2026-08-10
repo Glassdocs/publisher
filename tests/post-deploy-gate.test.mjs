@@ -107,12 +107,12 @@ test("content served to an anonymous request is proof of EXPOSURE — roll produ
   sb.cleanup();
 });
 
-test("exposed on a FIRST deploy: no previous build exists, so the project is deleted", () => {
+test("exposed with nothing to roll back to: the project THIS RUN created is deleted", () => {
   // The case the old step could never handle. Cloudflare refuses to delete the
   // active production deployment (8000034), so with nothing to roll back to,
   // removing the project this run created is the only way to stop serving.
   const { res, sb } = run([site(200), deployments(["only-one"]), deleteProjectOk], {
-    FIRST_DEPLOY: "true",
+    PROJECT_CREATED_HERE: "true",
   });
   assert.equal(res.status, 1);
   assert.match(res.out, /Deleted Pages project/);
@@ -127,13 +127,29 @@ test("exposed on a FIRST deploy: no previous build exists, so the project is del
   sb.cleanup();
 });
 
-test("exposed, not a first deploy, nothing to roll back to: says so instead of deleting", () => {
+test("exposed, nothing to roll back to, project NOT created here: says so instead of deleting", () => {
   // Deleting a project this run did NOT create would destroy a customer's site
   // over a check failure. Refuse, and say the site is still live.
-  const { res, sb } = run([site(200), deployments(["only-one"])], { FIRST_DEPLOY: "false" });
+  const { res, sb } = run([site(200), deployments(["only-one"])], { PROJECT_CREATED_HERE: "false" });
   assert.equal(res.status, 1);
   assert.match(res.out, /STILL LIVE/);
   assert.deepEqual(destructive(sb), [], "a pre-existing project is never deleted");
+  sb.cleanup();
+});
+
+test("the DELETE is gated on who created the project, NOT on the first-deploy heuristic", () => {
+  // FIRST_DEPLOY comes from access_ready=='false', which is really "the
+  // pre-deploy Access-app creation failed with 12130 or a 500" — a transient
+  // Cloudflare error sets it on a project that has existed for months. Gating a
+  // project delete on that would turn a 500 plus a bad probe into an outage, so
+  // the two flags must not be interchangeable.
+  const { res, sb } = run([site(200), deployments(["only-one"])], {
+    FIRST_DEPLOY: "true", // the heuristic says "brand new"...
+    PROJECT_CREATED_HERE: "false", // ...but this run demonstrably did not create it
+  });
+  assert.equal(res.status, 1);
+  assert.deepEqual(destructive(sb), [], "FIRST_DEPLOY alone must never authorise a delete");
+  assert.match(res.out, /did NOT create/);
   sb.cleanup();
 });
 
@@ -200,7 +216,10 @@ test("PROPERTY: no unreachable status, under any Access state, destroys anything
   for (const status of [522, 0, 500, 404]) {
     for (const [label, routes] of states) {
       for (const first of ["true", "false"]) {
-        const { sb } = run([site(status), deployments(["a", "b"]), ...routes], { FIRST_DEPLOY: first });
+        const { sb } = run([site(status), deployments(["a", "b"]), ...routes], {
+          FIRST_DEPLOY: first,
+          PROJECT_CREATED_HERE: first,
+        });
         assert.deepEqual(
           destructive(sb).map((r) => `${r.method} ${r.path}`),
           [],
@@ -215,7 +234,7 @@ test("PROPERTY: no unreachable status, under any Access state, destroys anything
 test("PROPERTY: proven exposure always results in an action, never a bare warning", () => {
   for (const [label, routes, env] of [
     ["previous build exists", [deployments(["bad", "good"]), rollbackOk], {}],
-    ["first deploy", [deployments(["only"]), deleteProjectOk], { FIRST_DEPLOY: "true" }],
+    ["created here, no previous build", [deployments(["only"]), deleteProjectOk], { PROJECT_CREATED_HERE: "true" }],
   ]) {
     const { res, sb } = run([site(200), ...routes], env);
     assert.equal(res.status, 1, label);

@@ -573,11 +573,20 @@ jobs:
       # is RETRIED, and a persistent failure hard-fails with the real error rather
       # than being swallowed and mis-surfaced two steps later.
       - name: Ensure Pages project (direct-upload)
+        id: ensure-project
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
           set -euo pipefail
+          # Did THIS run bring the project into existence? The post-deploy check
+          # may delete the project when it proves the site is exposed, and that
+          # is only defensible for a project we just created — deleting a
+          # customer's pre-existing site over a check failure is not a recovery,
+          # it is the outage. Recorded here because this is the only step that
+          # KNOWS; inferring it downstream from `access_ready` was wrong (that
+          # flag also goes false on a transient Cloudflare 500).
+          created_here=false
           BASE="https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/pages/projects"
           RESP=$(curl -s -w $'\n%{http_code}' "${BASE}/${PROJECT_NAME}" -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}")
           CODE=$(printf '%s' "$RESP" | tail -n1)
@@ -599,8 +608,9 @@ jobs:
               CRCODE=$(printf '%s' "$CR" | tail -n1)
               CRBODY=$(printf '%s' "$CR" | sed '$d')
               ERRS=$(printf '%s' "$CRBODY" | jq -c '.errors' 2>/dev/null || printf '%s' "$CRBODY")
-              if [ "$CRCODE" = "200" ]; then created=true; echo "Created '${PROJECT_NAME}'."; break; fi
-              # A concurrent run may have created it first — treat "name taken" as success.
+              if [ "$CRCODE" = "200" ]; then created=true; created_here=true; echo "Created '${PROJECT_NAME}'."; break; fi
+              # A concurrent run may have created it first — treat "name taken" as
+              # success, but NOT as ours: deleting it would destroy that run's project.
               if printf '%s' "$CRBODY" | grep -qi 'already exists\|not unique\|8000009'; then
                 created=true; echo "Project '${PROJECT_NAME}' already exists — continuing."; break
               fi
@@ -614,6 +624,10 @@ jobs:
           else
             echo "::warning::Couldn't verify the Pages project (HTTP ${CODE}); continuing. If the deploy fails with 'existing projects cannot be upgraded', the project is Git-connected — delete it in the Cloudflare dashboard and redeploy."
           fi
+          # Unknown ownership stays false — the delete below must never fire on a
+          # guess. A missed delete leaves a job that failed loudly; a wrong one
+          # destroys a customer's live site.
+          echo "created=${created_here}" >> "$GITHUB_OUTPUT"
 
       # ── 4. Deploy the built site to Cloudflare Pages ──
       - name: Deploy to Cloudflare Pages
@@ -717,11 +731,19 @@ jobs:
           # On a first deploy the access step's domain is name-based; prefer the
           # real subdomain the first-deploy step resolved after the project existed.
           DOMAIN: ${{ steps.access-firstdeploy.outputs.real_domain || steps.access.outputs.domain }}
-          # access_ready == 'false' means the Pages project did not exist before
-          # this run — so THIS run created it. Two things follow: the edge needs
-          # far longer to start serving, and there is no earlier deployment to
-          # roll back to (the only way to un-expose is to delete the project).
+          # Two DIFFERENT questions, deliberately answered by two flags.
+          #
+          # FIRST_DEPLOY only sizes the propagation window. access_ready=='false'
+          # is an approximation of "brand new" (it is really "the pre-deploy
+          # Access-app creation failed with 12130 or a 500"), and that is fine
+          # here: waiting longer than necessary costs a little CI time.
           FIRST_DEPLOY: ${{ steps.access.outputs.access_ready == 'false' }}
+          # PROJECT_CREATED_HERE gates the DELETE, so it must be exact. It comes
+          # from the step that actually created the project, not from an
+          # inference — access_ready also goes false on a transient Cloudflare
+          # 500, and deleting a customer's pre-existing site on the strength of a
+          # 500 would turn a failed check into an outage.
+          PROJECT_CREATED_HERE: ${{ steps.ensure-project.outputs.created }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
@@ -797,12 +819,13 @@ jobs:
               else
                 echo "::error::ROLLBACK FAILED — the exposed deployment is STILL LIVE at https://${DOMAIN}. Roll back or delete the project manually NOW (Cloudflare dashboard → Workers & Pages → ${PROJECT_NAME}). Response: $(printf '%s' "$RB" | jq -c '.errors // .' 2>/dev/null || printf '%s' "$RB")"
               fi
-            elif [ "${FIRST_DEPLOY}" = "true" ]; then
+            elif [ "${PROJECT_CREATED_HERE}" = "true" ]; then
               # No earlier deployment exists, so there is nothing to roll back
               # to; deleting the project is the only way to stop serving. Safe
-              # to do because this run created it — the account returns to the
-              # state it was in before the deploy.
-              echo "::error::No previous deployment to roll back to (first deploy). Deleting the Pages project — it was created by this run, so this restores the account to its prior state."
+              # ONLY because this run created it — the account returns to the
+              # state it was in before the deploy. Anything less certain than
+              # that takes the branch below and destroys nothing.
+              echo "::error::No previous deployment to roll back to, and this run created the project. Deleting it — that restores the account to its prior state."
               DEL=$(curl -s -X DELETE "${CF}/pages/projects/${PROJECT_NAME}" \
                 -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" || true)
               if [ "$(printf '%s' "$DEL" | jq -r '.success // false' 2>/dev/null)" = "true" ]; then
@@ -811,7 +834,7 @@ jobs:
                 echo "::error::DELETE FAILED — https://${DOMAIN} is STILL SERVING PRIVATE DOCS PUBLICLY. Delete the project manually NOW (Cloudflare dashboard → Workers & Pages → ${PROJECT_NAME} → Settings → Delete project). Response: $(printf '%s' "$DEL" | jq -c '.errors // .' 2>/dev/null || printf '%s' "$DEL")"
               fi
             else
-              echo "::error::No previous successful production deployment to roll back to, and this is not a first deploy — the exposed site is STILL LIVE. Remove it manually NOW (Cloudflare dashboard → Workers & Pages → ${PROJECT_NAME})."
+              echo "::error::No previous successful production deployment to roll back to, and this run did NOT create ${PROJECT_NAME} — so removing it is not Glassdocs' call to make. The exposed site is STILL LIVE: take it down manually NOW (Cloudflare dashboard → Workers & Pages → ${PROJECT_NAME})."
             fi
             exit 1
           fi

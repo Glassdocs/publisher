@@ -10,7 +10,11 @@
 #   3. Built site deploys to Cloudflare Pages
 #   4. On first deploy, the Access app is created right after the project exists
 #   5. Site is NOT publicly accessible after deploy (post-deploy)
-#   6. If the post-deploy check fails, the deployment is rolled back (deleted)
+#   6. If the post-deploy check proves the site is EXPOSED (content served to an
+#      unauthenticated request), production is rolled back — or, on a first
+#      deploy with nothing to roll back to, the project this run created is
+#      deleted. A site that simply isn't reachable yet is not "exposed": the
+#      Access configuration is verified over the API instead (#67).
 #
 # PUBLIC MODE (explicit opt-in, `public: true`): for documentation meant for
 # the whole world (e.g. a product's public docs). No Access app is created —
@@ -713,49 +717,145 @@ jobs:
           # On a first deploy the access step's domain is name-based; prefer the
           # real subdomain the first-deploy step resolved after the project existed.
           DOMAIN: ${{ steps.access-firstdeploy.outputs.real_domain || steps.access.outputs.domain }}
+          # access_ready == 'false' means the Pages project did not exist before
+          # this run — so THIS run created it. Two things follow: the edge needs
+          # far longer to start serving, and there is no earlier deployment to
+          # roll back to (the only way to un-expose is to delete the project).
+          FIRST_DEPLOY: ${{ steps.access.outputs.access_ready == 'false' }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
           set -euo pipefail
+          CF="https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}"
+
+          # FAIL CLOSED, but on EVIDENCE — the three outcomes are not the same
+          # thing and used to be collapsed into one (#67):
+          #
+          #   3xx redirect to the Access login → PROVEN GATED. Pass.
+          #   200, content served anonymously  → PROVEN EXPOSED. Destroy it.
+          #   522 / 000 / 4xx / 5xx            → NOTHING SERVED to anyone. That
+          #     demonstrates no leak and no gate. It is not grounds for a
+          #     destructive action; it is grounds for asking the Access API,
+          #     which is authoritative and doesn't wait on edge propagation.
+          #
+          # The old step treated every non-3xx as "roll back", which meant the
+          # only case that ever triggered the rollback was the one where there
+          # was nothing to roll back — see the deadline note below.
+          BUDGET=60
+          if [ "${FIRST_DEPLOY}" = "true" ]; then
+            # A project created seconds ago answers 522 at the edge for minutes.
+            # Measured on a real first deploy: created 05:02:56Z, still 522 at
+            # 05:04:12Z, serving the Access redirect by ~05:07Z. A 55s window
+            # failed that deploy even though the gate was up the whole time.
+            BUDGET=300
+            echo "First deploy — allowing up to ${BUDGET}s for the new project to reach the edge."
+          fi
           echo "Waiting for deployment to propagate..."
           sleep 15
 
-          # FAIL CLOSED. A site behind Cloudflare Access answers an unauthenticated
-          # request with a REDIRECT to the Access login (301/302/303/307/308). That
-          # redirect is the ONLY positive proof the gate is up. Anything else —
-          # 200 (content served = PUBLIC), 000 (couldn't reach it), 4xx, 5xx — is
-          # NOT proof, so we roll back rather than declare success. Retry a few
-          # times first to ride out propagation before deciding.
+          DEADLINE=$(( $(date +%s) + BUDGET ))
           STATUS="000"
-          for attempt in 1 2 3 4; do
+          attempt=0
+          while :; do
+            attempt=$((attempt + 1))
             STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 15 "https://${DOMAIN}" || echo "000")
-            echo "verify attempt ${attempt}/4: https://${DOMAIN} -> HTTP ${STATUS}"
+            echo "verify attempt ${attempt}: https://${DOMAIN} -> HTTP ${STATUS}"
             case "$STATUS" in
               301|302|303|307|308)
                 echo "Gate confirmed — unauthenticated request redirects to Access login (HTTP ${STATUS})."
                 exit 0
                 ;;
             esac
+            # A 200 can still be Access-policy propagation lag (the pre-flight
+            # check makes the same allowance), so keep probing to the deadline
+            # and judge on the FINAL observation rather than the first.
+            [ "$(date +%s)" -ge "$DEADLINE" ] && break
             sleep 10
           done
 
-          # Never observed the Access redirect → not provably gated → roll back.
-          echo "::error::https://${DOMAIN} is NOT provably gated (last HTTP ${STATUS}; expected an Access login redirect). Rolling back to fail closed."
-          DEPLOYMENTS=$(curl -s \
-            "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/pages/projects/${PROJECT_NAME}/deployments" \
-            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}")
-          LATEST_ID=$(echo "$DEPLOYMENTS" | jq -r '.result[0].id // empty')
-          if [ -n "$LATEST_ID" ]; then
-            DEL=$(curl -s -X DELETE \
-              "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/pages/projects/${PROJECT_NAME}/deployments/${LATEST_ID}?force=true" \
-              -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" || true)
-            if [ "$(echo "$DEL" | jq -r '.success // false' 2>/dev/null)" = "true" ]; then
-              echo "Rolled back deployment ${LATEST_ID}."
+          if [ "$STATUS" = "200" ]; then
+            # ── PROVEN EXPOSED ──────────────────────────────────────────────
+            # Content was served to an unauthenticated request for the whole
+            # window. This is the only branch that destroys anything.
+            echo "::error::https://${DOMAIN} SERVED CONTENT to an unauthenticated request (HTTP 200) for ${BUDGET}s — the Access gate is not up. Failing closed."
+            PREV=$(curl -s "${CF}/pages/projects/${PROJECT_NAME}/deployments?per_page=10" \
+              -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+              | jq -r '[(.result // [])[] | select(.environment == "production" and (.latest_stage.status // "") == "success")][1].id // empty')
+            if [ -n "$PREV" ]; then
+              # The deployment to remove IS the active production one, and
+              # Cloudflare refuses to DELETE that (code 8000034) even with
+              # ?force=true. Rolling production back to the previous good build
+              # is the supported way to stop serving it.
+              RB=$(curl -s -X POST "${CF}/pages/projects/${PROJECT_NAME}/deployments/${PREV}/rollback" \
+                -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" || true)
+              if [ "$(printf '%s' "$RB" | jq -r '.success // false' 2>/dev/null)" = "true" ]; then
+                echo "Rolled production back to ${PREV}. NOTE: if that build is also ungated, the site is still exposed — fix the Access app before redeploying."
+              else
+                echo "::error::ROLLBACK FAILED — the exposed deployment is STILL LIVE at https://${DOMAIN}. Roll back or delete the project manually NOW (Cloudflare dashboard → Workers & Pages → ${PROJECT_NAME}). Response: $(printf '%s' "$RB" | jq -c '.errors // .' 2>/dev/null || printf '%s' "$RB")"
+              fi
+            elif [ "${FIRST_DEPLOY}" = "true" ]; then
+              # No earlier deployment exists, so there is nothing to roll back
+              # to; deleting the project is the only way to stop serving. Safe
+              # to do because this run created it — the account returns to the
+              # state it was in before the deploy.
+              echo "::error::No previous deployment to roll back to (first deploy). Deleting the Pages project — it was created by this run, so this restores the account to its prior state."
+              DEL=$(curl -s -X DELETE "${CF}/pages/projects/${PROJECT_NAME}" \
+                -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" || true)
+              if [ "$(printf '%s' "$DEL" | jq -r '.success // false' 2>/dev/null)" = "true" ]; then
+                echo "Deleted Pages project ${PROJECT_NAME}. Fix the Access configuration, then re-run this deploy to recreate it."
+              else
+                echo "::error::DELETE FAILED — https://${DOMAIN} is STILL SERVING PRIVATE DOCS PUBLICLY. Delete the project manually NOW (Cloudflare dashboard → Workers & Pages → ${PROJECT_NAME} → Settings → Delete project). Response: $(printf '%s' "$DEL" | jq -c '.errors // .' 2>/dev/null || printf '%s' "$DEL")"
+              fi
             else
-              echo "::error::ROLLBACK FAILED — deployment ${LATEST_ID} may still be exposed; delete it manually (Cloudflare dashboard → Workers & Pages → ${PROJECT_NAME} → deployments). Delete response: $(echo "$DEL" | jq -c '.errors // .' 2>/dev/null || echo "$DEL")"
+              echo "::error::No previous successful production deployment to roll back to, and this is not a first deploy — the exposed site is STILL LIVE. Remove it manually NOW (Cloudflare dashboard → Workers & Pages → ${PROJECT_NAME})."
             fi
+            exit 1
+          fi
+
+          # ── INCONCLUSIVE ──────────────────────────────────────────────────
+          # Nothing was served, so nothing leaked — but nothing proved the gate
+          # either. Ask the Access API, which knows the configuration regardless
+          # of whether the edge is serving yet.
+          echo "No Access redirect observed within ${BUDGET}s (last HTTP ${STATUS}) — nothing was served either, so checking the Access configuration directly."
+          APP_ID=""; PAGE=1; LIST_OK=false
+          while :; do
+            LIST=$(curl -s "${CF}/access/apps?page=${PAGE}&per_page=50" -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}")
+            [ "$(printf '%s' "$LIST" | jq -r '.success // false')" = "true" ] || break
+            LIST_OK=true
+            APP_ID=$(printf '%s' "$LIST" | jq -r --arg d "$DOMAIN" \
+              '(.result // [])[] | select(((.self_hosted_domains // []) | index($d)) or ((.destinations // []) | map(.uri) | index($d)) or (.domain == $d)) | .id' | head -1)
+            [ -n "$APP_ID" ] && break
+            TOTAL_PAGES=$(printf '%s' "$LIST" | jq -r '.result_info.total_pages // 1')
+            COUNT=$(printf '%s' "$LIST" | jq -r '(.result // []) | length')
+            { [ "$PAGE" -ge "$TOTAL_PAGES" ] || [ "$COUNT" = "0" ]; } && break
+            PAGE=$((PAGE + 1))
+          done
+
+          POLICIES=0
+          if [ -n "$APP_ID" ]; then
+            POLICIES=$(curl -s "${CF}/access/apps/${APP_ID}/policies" -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+              | jq -r '(.result // []) | length' 2>/dev/null || echo 0)
+          fi
+
+          if [ -n "$APP_ID" ] && [ "$POLICIES" -gt 0 ]; then
+            # An app with at least one policy gates the domain the moment the
+            # edge starts serving it. This is the first-deploy case that used to
+            # fail a perfectly good deploy and then try to delete it.
+            echo "::warning::https://${DOMAIN} didn't answer within ${BUDGET}s (last HTTP ${STATUS}), but Access app ${APP_ID} covers it with ${POLICIES} policy(ies) — the gate IS configured and will apply as soon as the site is reachable. Confirm the site loads once propagation completes."
+            exit 0
+          fi
+
+          # No gate configured AND nothing served. Don't destroy anything —
+          # there is nothing being served to take down, and the next run fixes
+          # it — but never let this pass as verified.
+          if [ -n "$APP_ID" ]; then
+            echo "::error::Access app ${APP_ID} covers ${DOMAIN} but has NO policies — that gate allows no one and proves nothing. Nothing is being served right now (last HTTP ${STATUS}), so the deployment is left in place; fix the policies and re-run before sharing the URL."
+          elif [ "$LIST_OK" != "true" ]; then
+            # Never report "no gate exists" when what actually happened is "we
+            # couldn't look" — the two call for completely different fixes.
+            echo "::error::Couldn't read the Access configuration for ${DOMAIN} (the Cloudflare token may lack 'Access: Apps and Policies'), and the site didn't respond (last HTTP ${STATUS}) — so the gate is UNVERIFIED in both directions. The deployment is left in place; re-connect Cloudflare with a correctly scoped token and re-run before sharing the URL."
           else
-            echo "::error::ROLLBACK FAILED — couldn't identify the latest deployment; it may still be exposed. Verify and delete it manually (Cloudflare dashboard → Workers & Pages → ${PROJECT_NAME} → deployments)."
+            echo "::error::No Cloudflare Access app covers ${DOMAIN}, and the site didn't respond (last HTTP ${STATUS}). Nothing is being served yet, so the deployment is left in place — but it will be PUBLIC once it is. Create the Access app (re-run this deploy) and do NOT share the URL until a re-run reports the gate confirmed."
           fi
           exit 1
 
@@ -768,6 +868,10 @@ jobs:
       - name: Post-deploy — verify public site is live
         if: ${{ !cancelled() && steps.deploy.outcome == 'success' && inputs.public }}
         env:
+          # A first PUBLIC deploy races edge propagation exactly like the gated
+          # one (#67) — the project won't answer for minutes, and a 4-attempt
+          # window failed the deploy before the site ever had a chance to serve.
+          FIRST_DEPLOY: ${{ steps.access.outputs.access_ready == 'false' }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
@@ -777,16 +881,25 @@ jobs:
           DOMAIN=$(curl -s "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/pages/projects/${PROJECT_NAME}" \
             -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" | jq -r '.result.subdomain // empty')
           [ -z "$DOMAIN" ] && DOMAIN="${PROJECT_NAME}.pages.dev"
+          BUDGET=60
+          if [ "${FIRST_DEPLOY}" = "true" ]; then
+            BUDGET=300
+            echo "First deploy — allowing up to ${BUDGET}s for the new project to reach the edge."
+          fi
           echo "Waiting for deployment to propagate..."
           sleep 15
+          DEADLINE=$(( $(date +%s) + BUDGET ))
           STATUS="000"
-          for attempt in 1 2 3 4; do
+          attempt=0
+          while :; do
+            attempt=$((attempt + 1))
             STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 15 "https://${DOMAIN}" || echo "000")
-            echo "verify attempt ${attempt}/4: https://${DOMAIN} -> HTTP ${STATUS}"
+            echo "verify attempt ${attempt}: https://${DOMAIN} -> HTTP ${STATUS}"
             if [ "$STATUS" = "200" ]; then
               echo "Public site is live: https://${DOMAIN}"
               exit 0
             fi
+            [ "$(date +%s)" -ge "$DEADLINE" ] && break
             sleep 10
           done
           case "$STATUS" in

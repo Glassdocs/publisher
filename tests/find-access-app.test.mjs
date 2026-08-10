@@ -197,14 +197,21 @@ function expression(file) {
     .trim();
 }
 
-test("DRIFT GUARD: the tested matcher is character-for-character the one in deploy-pages.yml, at both call sites", () => {
+// Three call sites since #67: the post-deploy gate check now resolves the app
+// over the API when the live probe is inconclusive (a first deploy answers 522
+// for minutes before the edge serves it), so "is the gate configured?" no longer
+// depends on edge propagation. It reuses this exact matcher — the guard below is
+// what forces that, and it caught the addition when it was written by hand.
+const CALL_SITES = 3;
+
+test("DRIFT GUARD: the tested matcher is character-for-character the one in deploy-pages.yml, at every call site", () => {
   const expr = expression("find-access-app.jq");
   const occurrences = WORKFLOW.split(expr).length - 1;
   assert.equal(
     occurrences,
-    2,
-    "the matcher must appear verbatim at both the private-mode resolver and the public-mode gate remover; " +
-      "if you changed it in the workflow, update tests/fixtures/find-access-app.jq to match",
+    CALL_SITES,
+    "the matcher must appear verbatim at the private-mode resolver, the public-mode gate remover, and the " +
+      "post-deploy gate verification; if you changed it in the workflow, update tests/fixtures/find-access-app.jq to match",
   );
 });
 
@@ -217,10 +224,13 @@ test("DRIFT GUARD: the tested PUT-body builder is the one in deploy-pages.yml", 
 });
 
 test("DRIFT GUARD: no OTHER jq expression in the workflow selects an Access app by domain", () => {
-  // Catches a third call site added without the shared shape — the way the two
-  // existing ones drifted apart in the first place.
+  // Catches a call site added without the shared shape — the way the original
+  // two drifted apart in the first place. Counting selector LINES separately
+  // from verbatim matches above is what makes that possible: a near-copy would
+  // land here (n+1 selectors) while failing the verbatim count, naming the
+  // offending line instead of just reporting a number that didn't match.
   const selectors = WORKFLOW.split("\n").filter(
     (l) => l.includes("self_hosted_domains") && l.includes("index($d)"),
   );
-  assert.equal(selectors.length, 2, `unexpected app selectors:\n${selectors.join("\n")}`);
+  assert.equal(selectors.length, CALL_SITES, `unexpected app selectors:\n${selectors.join("\n")}`);
 });

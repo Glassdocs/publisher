@@ -22,6 +22,7 @@ export const SCRIPTS = path.join(REPO, "templates", "search", "scripts");
 export const SYNC_SCRIPT = path.join(SCRIPTS, "sync-access-policies.sh");
 export const LINT_SCRIPT = path.join(SCRIPTS, "docs-lint.sh");
 export const INJECT_SCRIPT = path.join(SCRIPTS, "inject-source-meta.mjs");
+export const WORKFLOW = path.join(REPO, ".github", "workflows", "deploy-pages.yml");
 
 // The scripts declare `#!/usr/bin/env bash` and CI runs bash 5. macOS ships
 // bash 3.2 as /bin/bash; set BASH_BIN to point at a newer one locally.
@@ -106,6 +107,72 @@ export function runSync(sb, env = {}) {
       CLOUDFLARE_API_TOKEN: "tok-test",
       CLOUDFLARE_ACCOUNT_ID: ACCOUNT_ID,
       APP_ID,
+      ...env,
+    },
+    encoding: "utf8",
+    timeout: SCRIPT_TIMEOUT_MS,
+    killSignal: "SIGKILL",
+  });
+  return decorate(res);
+}
+
+/**
+ * The dedented `run:` script of a named workflow step.
+ *
+ * Extracted rather than copied so the suite executes the SHIPPED text — a step
+ * whose logic is re-typed into a test fixture is a test of the fixture. Throws
+ * if the step or its `run:` block can't be found, so a rename fails loudly
+ * instead of silently testing nothing.
+ */
+export function workflowStep(name, file = WORKFLOW) {
+  const lines = readFileSync(file, "utf8").split("\n");
+  const start = lines.findIndex((l) => l.trim() === `- name: ${name}`);
+  if (start === -1) throw new Error(`workflowStep: no step named ${JSON.stringify(name)} in ${file}`);
+
+  const stepIndent = lines[start].indexOf("- name:");
+  let runAt = -1;
+  for (let i = start + 1; i < lines.length; i++) {
+    const l = lines[i];
+    if (!l.trim()) continue;
+    const indent = l.length - l.trimStart().length;
+    // Dedented back to the step list — we left the step without finding `run:`.
+    if (indent <= stepIndent) break;
+    if (/^run:\s*\|/.test(l.trim())) {
+      runAt = i;
+      break;
+    }
+  }
+  if (runAt === -1) throw new Error(`workflowStep: step ${JSON.stringify(name)} has no 'run: |' block`);
+
+  const runIndent = lines[runAt].length - lines[runAt].trimStart().length;
+  const body = [];
+  for (let i = runAt + 1; i < lines.length; i++) {
+    const l = lines[i];
+    if (!l.trim()) {
+      body.push("");
+      continue;
+    }
+    const indent = l.length - l.trimStart().length;
+    if (indent <= runIndent) break;
+    body.push(l.slice(runIndent + 2));
+  }
+  return body.join("\n").replace(/\s+$/, "") + "\n";
+}
+
+/**
+ * Run a workflow step's script inside a sandbox, with the propagation waits
+ * collapsed. The VERIFY_* overrides are declared in the workflow itself and
+ * default to the shipped values — see the seam comment there.
+ */
+export function runStep(sb, script, env = {}) {
+  const file = path.join(sb.dir, "step.sh");
+  writeFileSync(file, script);
+  const res = spawnSync(BASH, [file], {
+    env: {
+      ...sb.env,
+      VERIFY_SETTLE_SECONDS: "0",
+      VERIFY_POLL_SECONDS: "0",
+      VERIFY_BUDGET_SECONDS: "0",
       ...env,
     },
     encoding: "utf8",

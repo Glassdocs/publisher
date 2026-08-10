@@ -741,17 +741,21 @@ jobs:
           # The old step treated every non-3xx as "roll back", which meant the
           # only case that ever triggered the rollback was the one where there
           # was nothing to roll back — see the deadline note below.
-          BUDGET=60
+          # The three VERIFY_* overrides are a TEST SEAM: the suite drives every
+          # branch of this step verbatim, and would otherwise spend five minutes
+          # sleeping per case. Nothing sets them in CI or production — the
+          # defaults below are the shipped values.
+          BUDGET="${VERIFY_BUDGET_SECONDS:-60}"
           if [ "${FIRST_DEPLOY}" = "true" ]; then
             # A project created seconds ago answers 522 at the edge for minutes.
             # Measured on a real first deploy: created 05:02:56Z, still 522 at
             # 05:04:12Z, serving the Access redirect by ~05:07Z. A 55s window
             # failed that deploy even though the gate was up the whole time.
-            BUDGET=300
+            BUDGET="${VERIFY_BUDGET_SECONDS:-300}"
             echo "First deploy — allowing up to ${BUDGET}s for the new project to reach the edge."
           fi
           echo "Waiting for deployment to propagate..."
-          sleep 15
+          sleep "${VERIFY_SETTLE_SECONDS:-15}"
 
           DEADLINE=$(( $(date +%s) + BUDGET ))
           STATUS="000"
@@ -770,7 +774,7 @@ jobs:
             # check makes the same allowance), so keep probing to the deadline
             # and judge on the FINAL observation rather than the first.
             [ "$(date +%s)" -ge "$DEADLINE" ] && break
-            sleep 10
+            sleep "${VERIFY_POLL_SECONDS:-10}"
           done
 
           if [ "$STATUS" = "200" ]; then
@@ -881,13 +885,14 @@ jobs:
           DOMAIN=$(curl -s "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/pages/projects/${PROJECT_NAME}" \
             -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" | jq -r '.result.subdomain // empty')
           [ -z "$DOMAIN" ] && DOMAIN="${PROJECT_NAME}.pages.dev"
-          BUDGET=60
+          # Same test seam as the gated check above; defaults are the shipped values.
+          BUDGET="${VERIFY_BUDGET_SECONDS:-60}"
           if [ "${FIRST_DEPLOY}" = "true" ]; then
-            BUDGET=300
+            BUDGET="${VERIFY_BUDGET_SECONDS:-300}"
             echo "First deploy — allowing up to ${BUDGET}s for the new project to reach the edge."
           fi
           echo "Waiting for deployment to propagate..."
-          sleep 15
+          sleep "${VERIFY_SETTLE_SECONDS:-15}"
           DEADLINE=$(( $(date +%s) + BUDGET ))
           STATUS="000"
           attempt=0
@@ -900,7 +905,7 @@ jobs:
               exit 0
             fi
             [ "$(date +%s)" -ge "$DEADLINE" ] && break
-            sleep 10
+            sleep "${VERIFY_POLL_SECONDS:-10}"
           done
           case "$STATUS" in
             301|302|303|307|308)

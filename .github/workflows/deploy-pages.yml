@@ -836,6 +836,30 @@ jobs:
             else
               echo "::error::No previous successful production deployment to roll back to, and this run did NOT create ${PROJECT_NAME} — so removing it is not Glassdocs' call to make. The exposed site is STILL LIVE: take it down manually NOW (Cloudflare dashboard → Workers & Pages → ${PROJECT_NAME})."
             fi
+
+            # ── Did that actually close the exposure? (#71) ─────────────────
+            # "We took an action" is not "the site stopped serving", and
+            # reporting the first as if it were the second is the same
+            # conflation this step exists to avoid. Two ways it bites: the
+            # build we rolled back TO can be ungated as well (swapping one
+            # exposed build for another), and the rollback/delete call itself
+            # can fail. Re-probe and say which happened. Cheap — the run has
+            # already failed; this only decides how loudly.
+            sleep "${VERIFY_SETTLE_SECONDS:-10}"
+            AFTER="000"
+            REDEADLINE=$(( $(date +%s) + ${VERIFY_REPROBE_SECONDS:-30} ))
+            while :; do
+              AFTER=$(curl -s -o /dev/null -w "%{http_code}" --max-time 15 "https://${DOMAIN}" || echo "000")
+              echo "post-action probe: https://${DOMAIN} -> HTTP ${AFTER}"
+              [ "$AFTER" != "200" ] && break
+              [ "$(date +%s)" -ge "$REDEADLINE" ] && break
+              sleep "${VERIFY_POLL_SECONDS:-5}"
+            done
+            if [ "$AFTER" = "200" ]; then
+              echo "::error::STILL EXPOSED — https://${DOMAIN} is SERVING CONTENT PUBLICLY right now, after the action above. Either that action failed or the build it fell back to is ungated too. Take the site down by hand IMMEDIATELY: Cloudflare dashboard → Workers & Pages → ${PROJECT_NAME} → Settings → Delete project. Do not redeploy until the Access app for ${DOMAIN} exists with at least one policy."
+            else
+              echo "Exposure closed — https://${DOMAIN} no longer serves content to an unauthenticated request (HTTP ${AFTER}). The deploy still FAILED: fix the Access configuration for ${DOMAIN} before redeploying."
+            fi
             exit 1
           fi
 

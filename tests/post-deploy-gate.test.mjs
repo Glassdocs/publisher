@@ -153,6 +153,57 @@ test("the DELETE is gated on who created the project, NOT on the first-deploy he
   sb.cleanup();
 });
 
+// ── did the action actually close the exposure? (#71) ──────────────────
+// "We took an action" is not "the site stopped serving". Reporting the first as
+// if it were the second is the same conflation the whole step exists to avoid,
+// and it was documented as an invariant for months without being implemented.
+
+test("after a rollback that works, the run says the exposure is CLOSED", () => {
+  // 200 for the verification probe, then gated once production has rolled back.
+  const { res, sb } = run([
+    { ...site(200), times: 1 },
+    site(302),
+    deployments(["active-bad", "older-good"]),
+    rollbackOk,
+  ]);
+  assert.equal(res.status, 1, "the deploy still failed — it published an ungated site");
+  assert.match(res.out, /Exposure closed/);
+  assert.doesNotMatch(res.out, /STILL EXPOSED/);
+  sb.cleanup();
+});
+
+test("a rollback to a build that is ALSO ungated must not read as handled", () => {
+  // The failure this case exists for: rolling back swaps one exposed build for
+  // another. The run already failed either way — what matters is that the
+  // operator is told the site is live right now, not that a rollback happened.
+  const { res, sb } = run([site(200), deployments(["active-bad", "older-good"]), rollbackOk]);
+  assert.equal(res.status, 1);
+  assert.match(res.out, /STILL EXPOSED/);
+  assert.match(res.out, /SERVING CONTENT PUBLICLY right now/);
+  assert.match(res.out, /Delete project/, "names the manual step");
+  assert.doesNotMatch(res.out, /Exposure closed/);
+  sb.cleanup();
+});
+
+test("when nothing could be done, the re-probe still reports the live state", () => {
+  // No rollback target and not our project — the step destroys nothing, so the
+  // site is certainly still up. Say so rather than ending on a passive note.
+  const { res, sb } = run([site(200), deployments(["only-one"])], {
+    PROJECT_CREATED_HERE: "false",
+  });
+  assert.equal(res.status, 1);
+  assert.match(res.out, /STILL EXPOSED/);
+  assert.deepEqual(destructive(sb), []);
+  sb.cleanup();
+});
+
+test("the re-probe runs only on the exposed path — a confirmed gate costs nothing extra", () => {
+  const { sb } = run([site(302)]);
+  const probes = sb.requests().filter((r) => r.url.startsWith(`https://${DOMAIN}`));
+  assert.equal(probes.length, 1, `a gated deploy must probe once, not re-probe: ${probes.length}`);
+  sb.cleanup();
+});
+
 // ── inconclusive: the first-deploy race that started this ──────────────
 
 test("522 with the Access app configured is PROPAGATION, not exposure — pass with a warning", () => {

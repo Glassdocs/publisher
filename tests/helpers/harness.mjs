@@ -173,6 +173,7 @@ export function runStep(sb, script, env = {}) {
       VERIFY_SETTLE_SECONDS: "0",
       VERIFY_POLL_SECONDS: "0",
       VERIFY_BUDGET_SECONDS: "0",
+      VERIFY_REPROBE_SECONDS: "0",
       ...env,
     },
     encoding: "utf8",

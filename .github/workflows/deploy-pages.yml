@@ -284,6 +284,161 @@ jobs:
       - name: Add security headers
         run: cp _playbook/templates/_headers "$SITE_DIR/_headers"
 
+      # Pull this KB's generated page audio out of its GitHub Release and into
+      # the site, so it ships as part of THIS deployment (#94).
+      #
+      # WHY SAME-ORIGIN, and why it is not negotiable: `_headers` (copied one step
+      # above, from the platform template, because "security posture is not a
+      # per-KB choice") sets `default-src 'self'` and declares NO `media-src` — so
+      # media inherits `'self'` and only the KB's own origin can be played. That
+      # is also the only place inside the KB's Cloudflare Access app: audio served
+      # from a bucket or a second origin would be the spoken content of a gated
+      # page, reachable without the gate. Serving it from $SITE_DIR is what makes
+      # a private KB's audio as private as the page it was spoken from.
+      #
+      # Both tiers, one code path: client-hosted checks out with github.token
+      # under `permissions: contents: read` (declared at the top of this job) and
+      # managed checks out with SOURCE_TOKEN, a Glassdocs App installation token
+      # carrying the same Contents permission. A repo's own releases sit under
+      # Contents, so the same request works either way.
+      #
+      # FAIL-CLOSED. Audio ships only when vars.AUDIO_ENABLED is exactly `true`.
+      # Unset, empty, `1`, `yes`, `TRUE` → no site/audio/, no manifest, nothing
+      # for a reader to click, and no reader-side logic needed to make that true.
+      # Any failure fetching (no release, a bad asset, a network error) also lands
+      # on "no audio" and only WARNS: audio is a derived artifact, and blocking a
+      # documentation deploy over it would be the worse failure.
+      #
+      # vars.* in a REUSABLE workflow resolves against the CALLING repository, the
+      # same way office-cidrs does further down — so this flag reaches every
+      # existing KB the moment the publisher release lands, with no re-scaffold
+      # and no PR into a customer repo. (Whoever writes and surfaces the variable
+      # is a separate change; this step only reads it.)
+      - name: Fetch published audio
+        env:
+          # Env-indirection, NOT `${{ }}` inlined into the script below — same
+          # reason as the meta step above: these are caller-controlled values on
+          # a runner that holds SOURCE_TOKEN and the Cloudflare token, and bash
+          # re-evaluates inlined interpolation. As $VARS they are data, never code.
+          AUDIO_ENABLED: ${{ vars.AUDIO_ENABLED }}
+          AUDIO_REPO: ${{ inputs.source-repo != '' && inputs.source-repo || github.repository }}
+          AUDIO_TOKEN: ${{ inputs.source-repo != '' && secrets.SOURCE_TOKEN || github.token }}
+          AUDIO_TAG: glassdocs-audio
+        run: |
+          set -uo pipefail
+          if [ "${AUDIO_ENABLED:-}" != "true" ]; then
+            if [ -n "${AUDIO_ENABLED:-}" ]; then
+              echo "::warning::AUDIO_ENABLED is set to '${AUDIO_ENABLED}', which is not the literal string 'true' — publishing NO audio. Set the repo variable AUDIO_ENABLED to exactly 'true' to publish it."
+            else
+              echo "Audio publishing is off (AUDIO_ENABLED unset) — no site/audio/, no manifest."
+            fi
+            exit 0
+          fi
+
+          API="https://api.github.com"
+          AUTH="Authorization: Bearer ${AUDIO_TOKEN}"
+          VSN="X-GitHub-Api-Version: 2022-11-28"
+
+          REL=$(curl -sS -H "$AUTH" -H "$VSN" -H "Accept: application/vnd.github+json" \
+                  --max-time 30 "${API}/repos/${AUDIO_REPO}/releases/tags/${AUDIO_TAG}" || echo '')
+          REL_ID=$(printf '%s' "$REL" | jq -r '.id // empty' 2>/dev/null || echo '')
+          if [ -z "$REL_ID" ]; then
+            echo "::notice::AUDIO_ENABLED is on but ${AUDIO_REPO} has no '${AUDIO_TAG}' release yet — nothing to publish. Generate audio from the Glassdocs admin first."
+            exit 0
+          fi
+
+          ASSETS=$(curl -sS -H "$AUTH" -H "$VSN" -H "Accept: application/vnd.github+json" \
+                     --max-time 30 "${API}/repos/${AUDIO_REPO}/releases/${REL_ID}/assets?per_page=100" || echo '[]')
+
+          # Stage in a temp dir and only move it into the site once everything
+          # downloaded. A half-fetched site/audio/ would serve truncated clips.
+          STAGE="$(mktemp -d)"
+          META="$(mktemp -d)"
+          ok=true
+          # Asset names this publisher owns: gd-audio-<20 hex>.<ext>. The filter is
+          # also the path guard — the name becomes a filename, and GitHub's own
+          # rewriting of unsafe characters is not something to rely on.
+          NAMES=$(printf '%s' "$ASSETS" | jq -r '.[] | select(.name | test("^gd-audio-[0-9a-f]{20}\\.[A-Za-z0-9]+$")) | "\(.id) \(.name)"')
+          while read -r ID NAME; do
+            [ -n "${ID:-}" ] || continue
+            case "$NAME" in
+              gd-audio-*.json) DEST="${META}/${NAME}" ;;
+              *)               DEST="${STAGE}/${NAME}" ;;
+            esac
+            # -L follows GitHub's 302 to release-assets.githubusercontent.com.
+            # curl drops the Authorization header on a cross-host redirect (and
+            # --location-trusted, which would keep it, is deliberately NOT used),
+            # so the installation token is never handed to the asset CDN.
+            if ! curl -sSL -f -H "$AUTH" -H "Accept: application/octet-stream" \
+                   --max-time 120 -o "$DEST" "${API}/repos/${AUDIO_REPO}/releases/assets/${ID}"; then
+              echo "::warning::Failed to download audio asset ${NAME} — publishing no audio this deploy."
+              ok=false
+              break
+            fi
+          done <<< "$NAMES"
+
+          if [ "$ok" != "true" ]; then
+            rm -rf "$STAGE" "$META"
+            exit 0
+          fi
+
+          # Drop any sidecar whose clip is missing or whose byte count disagrees
+          # with the file we actually downloaded. The reader must never be handed
+          # a manifest entry pointing at a 404 or at truncated audio.
+          for S in "${META}"/gd-audio-*.json; do
+            [ -f "$S" ] || continue
+            CLIP=$(jq -r '.audio // empty' "$S" 2>/dev/null || echo '')
+            WANT=$(jq -r '.bytes // empty' "$S" 2>/dev/null || echo '')
+            if [ -z "$CLIP" ] || [ ! -f "${STAGE}/${CLIP}" ]; then
+              echo "::warning::Audio sidecar $(basename "$S") has no matching clip on the release — skipping that page."
+              rm -f "$S"
+              continue
+            fi
+            GOT=$(wc -c < "${STAGE}/${CLIP}" | tr -d ' ')
+            if [ -n "$WANT" ] && [ "$WANT" != "$GOT" ]; then
+              echo "::warning::Audio clip ${CLIP} is ${GOT} bytes but its sidecar says ${WANT} — skipping that page."
+              rm -f "$S" "${STAGE}/${CLIP}"
+            fi
+          done
+
+          # The manifest is REGENERATED from the assets actually present, never
+          # carried over: D1 is the source of truth for what was generated, this
+          # file is the derived statement of what THIS deployment serves. Keyed by
+          # source path, carrying the source_sha the reader compares against the
+          # page's own <meta name="source-sha"> — a mismatch means the page was
+          # edited since, and #97 must say so rather than play stale audio.
+          COUNT=$(find "$META" -name 'gd-audio-*.json' | wc -l | tr -d ' ')
+          if [ "$COUNT" = "0" ]; then
+            echo "::notice::No usable audio clips on the '${AUDIO_TAG}' release — publishing no audio."
+            rm -rf "$STAGE" "$META"
+            exit 0
+          fi
+          if ! jq -s --arg repo "$AUDIO_REPO" '{
+                 version: 1,
+                 repo: $repo,
+                 pages: (map(select(.path and .audio) | {
+                   key: .path,
+                   value: {
+                     file: ("/audio/" + .audio),
+                     source_sha: .source_sha,
+                     voice: .voice,
+                     model: .model,
+                     bytes: .bytes,
+                     duration_seconds: .duration_seconds,
+                     generated_at: .generated_at
+                   }
+                 }) | from_entries)
+               }' "${META}"/gd-audio-*.json > "${STAGE}/manifest.json"; then
+            echo "::warning::Could not build /audio/manifest.json — publishing no audio this deploy."
+            rm -rf "$STAGE" "$META"
+            exit 0
+          fi
+          COUNT=$(jq -r '.pages | length' "${STAGE}/manifest.json")
+          mkdir -p "${SITE_DIR}/audio"
+          cp -R "${STAGE}/." "${SITE_DIR}/audio/"
+          rm -rf "$STAGE" "$META"
+          echo "Published audio for ${COUNT} page(s) into ${SITE_DIR}/audio/ (same-origin, inside this KB's Access app)."
+
       # ── 0. Cloudflare credential preflight ──
       # Report exactly what arrived so an empty/short secret is diagnosable at a
       # glance (the API otherwise fails with a cryptic "could not route" when the

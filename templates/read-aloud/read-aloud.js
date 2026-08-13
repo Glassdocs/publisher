@@ -366,6 +366,9 @@
   var PAUSE = "\u23F8";
   var STOP = "\u23F9";
   var READ_TITLE = "Read this page aloud with a speech voice installed on your device";
+  var LISTEN = "Listen";
+  var LABEL_CLASS = "glassdocs-ra-label";
+  var GLYPH_CLASS = "glassdocs-ra-glyph";
   var BUTTON_STYLE = [
     "font:inherit",
     "line-height:1",
@@ -377,36 +380,81 @@
     "opacity:0.75",
     "cursor:pointer"
   ].join(";");
+  var HEADER_BUTTON_STYLE = [
+    "font:inherit",
+    "font-size:.9rem",
+    "line-height:1rem",
+    "color:inherit",
+    "background:transparent",
+    "border:0",
+    "cursor:pointer"
+  ].join(";");
+  var HEADER_PLAY_STYLE = [HEADER_BUTTON_STYLE, "display:flex", "align-items:center", "gap:.3rem"].join(";");
   var DISABLED_STYLE = [BUTTON_STYLE, "opacity:0.4", "cursor:default"].join(";");
-  function button(doc, label, title) {
+  var HEADER_DISABLED_STYLE = [HEADER_PLAY_STYLE, "opacity:.4", "cursor:default"].join(";");
+  function button(doc, glyph, title, style) {
     const el = doc.createElement("button");
     el.type = "button";
-    el.textContent = label;
     el.title = title;
     el.setAttribute("aria-label", title);
-    el.style.cssText = BUTTON_STYLE;
+    el.style.cssText = style;
+    const g = doc.createElement("span");
+    g.className = GLYPH_CLASS;
+    g.textContent = glyph;
+    el.append(g);
     return el;
   }
-  function insert(root, el) {
-    const h1 = root.querySelector("h1");
-    if (h1 && h1.parentNode) {
-      h1.parentNode.insertBefore(el, h1.nextSibling);
-      return;
+  function resolveSlot(doc, root) {
+    const palette = doc.querySelector('form.md-header__option[data-md-component="palette"]');
+    if (palette?.parentNode) {
+      return { parent: palette.parentNode, before: palette.nextSibling, placement: "header" };
     }
-    root.insertBefore(el, root.firstChild);
+    const nav = doc.querySelector("nav.md-header__inner");
+    if (nav) {
+      return { parent: nav, before: nav.querySelector(".md-header__source"), placement: "header" };
+    }
+    const h1 = root.querySelector("h1");
+    if (h1?.parentNode) {
+      return { parent: h1.parentNode, before: h1.nextSibling, placement: "article" };
+    }
+    return { parent: root, before: root.firstChild, placement: "article" };
+  }
+  var STYLE_ID = "glassdocs-read-aloud-style";
+  var HEADER_CSS = `#${READ_ALOUD_ID}[data-placement=header] .${LABEL_CLASS}{display:none}@media screen and (min-width:60em){#${READ_ALOUD_ID}[data-placement=header] .${LABEL_CLASS}{display:inline}}`;
+  function injectHeaderStyle(doc) {
+    const host = doc.head ?? doc.documentElement;
+    if (!host || host.querySelector(`#${STYLE_ID}`)) return;
+    const style = doc.createElement("style");
+    style.id = STYLE_ID;
+    style.textContent = HEADER_CSS;
+    host.appendChild(style);
   }
   function mount(doc, root, voice, reason) {
+    const slot = resolveSlot(doc, root);
+    const inHeader = slot.placement === "header";
     const bar = doc.createElement("div");
     bar.id = READ_ALOUD_ID;
-    bar.style.cssText = "display:flex;gap:0.4em;align-items:center;margin:0 0 1.2em";
-    const playBtn = button(doc, PLAY, voice ? READ_TITLE : reason ?? READ_TITLE);
-    const stopBtn = button(doc, STOP, "Stop reading");
+    bar.dataset.placement = slot.placement;
+    bar.style.cssText = inHeader ? "display:flex;align-items:center;margin:0" : "display:flex;gap:0.4em;align-items:center;margin:0 0 1.2em";
+    const title = voice ? READ_TITLE : reason ?? READ_TITLE;
+    const playBtn = button(doc, PLAY, title, inHeader ? HEADER_PLAY_STYLE : BUTTON_STYLE);
+    const stopBtn = button(doc, STOP, "Stop reading", inHeader ? HEADER_BUTTON_STYLE : BUTTON_STYLE);
+    if (inHeader) {
+      playBtn.className = "md-header__button";
+      stopBtn.className = "md-header__button";
+      injectHeaderStyle(doc);
+    }
+    const label = doc.createElement("span");
+    label.className = LABEL_CLASS;
+    label.textContent = LISTEN;
+    label.style.cssText = inHeader ? "font-size:.7rem;letter-spacing:-.025em" : "margin-left:0.4em";
+    playBtn.append(label);
     stopBtn.hidden = true;
     bar.append(playBtn, stopBtn);
     if (!voice) {
       playBtn.disabled = true;
-      playBtn.style.cssText = DISABLED_STYLE;
-      insert(root, bar);
+      playBtn.style.cssText = inHeader ? HEADER_DISABLED_STYLE : DISABLED_STYLE;
+      slot.parent.insertBefore(bar, slot.before);
       return;
     }
     const resolve = () => {
@@ -414,12 +462,13 @@
       return createSpeechSourceWith(blocks, voice);
     };
     const transport = createTransport(resolve);
+    const playGlyph = playBtn.querySelector(`.${GLYPH_CLASS}`);
     transport.onStateChange((state) => {
       const playing = state === "playing";
-      playBtn.textContent = playing ? PAUSE : PLAY;
-      const label = playing ? "Pause reading" : state === "paused" ? "Resume reading" : READ_TITLE;
-      playBtn.title = label;
-      playBtn.setAttribute("aria-label", label);
+      if (playGlyph) playGlyph.textContent = playing ? PAUSE : PLAY;
+      const next = playing ? "Pause reading" : state === "paused" ? "Resume reading" : READ_TITLE;
+      playBtn.title = next;
+      playBtn.setAttribute("aria-label", next);
       stopBtn.hidden = !(playing || state === "paused");
     });
     playBtn.addEventListener("click", () => {
@@ -427,7 +476,7 @@
     });
     stopBtn.addEventListener("click", () => transport.stop());
     globalThis.window?.addEventListener("pagehide", () => transport.stop());
-    insert(root, bar);
+    slot.parent.insertBefore(bar, slot.before);
   }
   async function initReadAloudPage(doc = document) {
     const root = mainContentRoot(doc);

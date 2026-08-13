@@ -206,6 +206,8 @@
   }
 
   // src/sidepanel/speech-source.ts
+  var NOTHING_TO_READ = "Nothing to read on this page";
+  var NO_LOCAL_VOICE = "No on-device voice is installed, so reading aloud would send this page to a remote speech service";
   var MAX_CHUNK = 200;
   var VOICES_TIMEOUT_MS = 2e3;
   function getSynth() {
@@ -375,6 +377,7 @@
     "opacity:0.75",
     "cursor:pointer"
   ].join(";");
+  var DISABLED_STYLE = [BUTTON_STYLE, "opacity:0.4", "cursor:default"].join(";");
   function button(doc, label, title) {
     const el = doc.createElement("button");
     el.type = "button";
@@ -392,14 +395,20 @@
     }
     root.insertBefore(el, root.firstChild);
   }
-  function mount(doc, root, voice) {
+  function mount(doc, root, voice, reason) {
     const bar = doc.createElement("div");
     bar.id = READ_ALOUD_ID;
     bar.style.cssText = "display:flex;gap:0.4em;align-items:center;margin:0 0 1.2em";
-    const playBtn = button(doc, PLAY, READ_TITLE);
+    const playBtn = button(doc, PLAY, voice ? READ_TITLE : reason ?? READ_TITLE);
     const stopBtn = button(doc, STOP, "Stop reading");
     stopBtn.hidden = true;
     bar.append(playBtn, stopBtn);
+    if (!voice) {
+      playBtn.disabled = true;
+      playBtn.style.cssText = DISABLED_STYLE;
+      insert(root, bar);
+      return;
+    }
     const resolve = () => {
       const blocks = readableBlocks(mainContentRoot(doc));
       return createSpeechSourceWith(blocks, voice);
@@ -423,10 +432,16 @@
   async function initReadAloudPage(doc = document) {
     const root = mainContentRoot(doc);
     if (!root) return false;
-    if (toChunks(readableBlocks(root)).length === 0) return false;
+    if (toChunks(readableBlocks(root)).length === 0) {
+      mount(doc, root, null, NOTHING_TO_READ);
+      return true;
+    }
     const voice = await resolveLocalVoice();
-    if (!voice) return false;
-    mount(doc, root, voice);
+    if (!voice) {
+      mount(doc, root, null, NO_LOCAL_VOICE);
+      return true;
+    }
+    mount(doc, root, voice, null);
     return true;
   }
   if (typeof document !== "undefined") {

@@ -55,7 +55,29 @@ if [ ! -f mkdocs.yml ]; then
   fail "No mkdocs.yml at repo root - a Glassdocs KB is Markdown (docs/*.md + mkdocs.yml)"
 fi
 
-# 3. No custom HTML pages. Author in Markdown; mkdocs renders the HTML at
+# 3. The docs directory must be there to be checked. Checks 4 and 5 are both
+#    guarded on `[ -d "$DOCS_DIR" ]`, so without this a missing directory took
+#    neither branch: `fails` stayed 0, the script printed "docs-lint: passed",
+#    and the deploy went green with BOTH hard checks silently skipped. That is
+#    what a KB whose docs_dir isn't `docs` got from the publisher, which passed
+#    DOCS_DIR=docs regardless (#152). A KB the lint could not look at is not a
+#    KB that passed.
+#
+#    The same vacuous pass survives when the directory is THERE but git cannot
+#    see into it — a gitignored, generated or submoduled docs dir. `[ -d ]`
+#    is satisfied, `git ls-files` prints nothing and exits 0, and checks 4 and
+#    5 look at an empty list (#172). Inside a work tree the lint therefore also
+#    demands tracked content, using list_under so this check and the checks it
+#    protects read the same source and cannot diverge. Outside a work tree
+#    list_under falls back to `find`, and an empty dir there is a fixture
+#    concern rather than a KB defect, so the demand does not apply.
+if [ ! -d "$DOCS_DIR" ]; then
+  fail "No $DOCS_DIR/ directory — set docs_dir in mkdocs.yml or move the Markdown"
+elif git rev-parse --is-inside-work-tree >/dev/null 2>&1 && [ -z "$(list_under "$DOCS_DIR")" ]; then
+  fail "$DOCS_DIR/ exists but has no committed files — the deploy would publish nothing and the checks below cannot run; commit the Markdown or check .gitignore"
+fi
+
+# 4. No custom HTML pages. Author in Markdown; mkdocs renders the HTML at
 #    deploy time. A tracked *.html/*.htm anywhere under docs/ is a violation.
 if [ -d "$DOCS_DIR" ]; then
   htmls=$(list_under "$DOCS_DIR" | grep -iE '\.html?$' || true)
@@ -64,7 +86,7 @@ if [ -d "$DOCS_DIR" ]; then
   fi
 fi
 
-# 4. No commercial/contractual content unless explicitly allowed.
+# 5. No commercial/contractual content unless explicitly allowed.
 #    Effort-only artefacts (proposal.md, estimate.md, plan.md) are legitimate
 #    KB content - work breakdowns and dev-day estimates are project planning,
 #    not commerce. Files that bind a dollar amount to a deliverable (rate

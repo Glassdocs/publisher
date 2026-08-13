@@ -124,8 +124,15 @@ jobs:
       deployments: write
     env:
       PROJECT_NAME: ${{ inputs.project-name }}
-      # The built site is always published from ./site (Zensical's default
-      # output dir, the same one mkdocs used).
+      # PRE-RESOLUTION DEFAULTS, not facts. `docs` and `site` are Zensical's
+      # defaults; the KB's mkdocs.yml decides the real ones via docs_dir/site_dir,
+      # and the "Resolve KB layout from mkdocs.yml" step below overwrites both
+      # through $GITHUB_ENV for every later step. This block used to assert
+      # "always published from ./site", which is how a KB with site_dir set
+      # published a stale ./site under a green tick (#153); DOCS_DIR was pinned to
+      # `docs` on the lint step, which is how a KB with docs_dir set was linted
+      # against a directory it does not have (#152).
+      DOCS_DIR: docs
       SITE_DIR: site
     steps:
       # SECURITY: fail closed on a malformed project name before it reaches any
@@ -186,30 +193,7 @@ jobs:
             templates/_headers
             templates/search/scripts/docs-lint.sh
             templates/search/scripts/inject-source-meta.mjs
-
-      # Compliance lint on the Markdown source — fails the deploy on violations
-      # BEFORE any side effects. Markdown-only rules: a deploy workflow exists,
-      # no custom HTML is tracked, no commercial content unless allow-financial.
-      - name: Run docs compliance lint
-        if: ${{ !inputs.skip-lint }}
-        env:
-          DOCS_DIR: docs
-          ALLOW_FINANCIAL: ${{ inputs.allow-financial }}
-        run: |
-          set -uo pipefail
-          out=$(bash _playbook/templates/search/scripts/docs-lint.sh) || rc=$?
-          rc=${rc:-0}
-          echo "$out" | while IFS= read -r line; do
-            case "$line" in
-              FAIL:*) echo "::error::${line#FAIL: }" ;;
-              WARN:*) echo "::warning::${line#WARN: }" ;;
-              *)      echo "$line" ;;
-            esac
-          done
-          if [ "$rc" -ne 0 ]; then
-            echo "::error::Docs lint failed. See https://github.com/Glassdocs/glassdocs for playbook rules. Deploy blocked."
-            exit "$rc"
-          fi
+            templates/read-aloud/read-aloud.js
 
       # setup-python's pip cache keys on a requirements/pyproject file and HARD
       # FAILS if none exists — which is exactly a minimal Markdown KB (mkdocs.yml
@@ -230,6 +214,140 @@ jobs:
         with:
           python-version: ${{ inputs.python-version }}
           cache: pip
+
+      # WHERE the Markdown is read from and WHERE the build writes the site are
+      # the KB's decisions, not ours. `docs_dir` and `site_dir` are first-class
+      # MkDocs options that Zensical honours; `docs` and `site` are only its
+      # DEFAULTS. Asserting the defaults produced two silent failures:
+      #   - a KB that moved site_dir had its build output ignored and whatever
+      #     already sat in ./site published instead — exit 0, green tick, wrong
+      #     content served indefinitely (#153);
+      #   - a KB that moved docs_dir was linted against a ./docs it does not
+      #     have, which skipped BOTH hard checks and still printed
+      #     "docs-lint: passed", and had every page stamped with a source-path
+      #     under docs/ that does not exist (#152).
+      #
+      # This runs before the LINT (which consumes $DOCS_DIR) and before the build,
+      # so `Set up Python` and its pip-cache prerequisite moved up with it; neither
+      # depends on the lint. $GITHUB_ENV overrides the job-level `env:` for every
+      # LATER step, so the lint, the meta injector, the audio copy, the headers
+      # copy and `pages deploy` all follow this one answer.
+      #
+      # No new runner dependency: PyYAML is already installed (Zensical depends on
+      # it) and `Set up Python` ran above. The read COMPOSES the YAML rather than
+      # loading it, and that is load-bearing: a Material-flavoured mkdocs.yml
+      # legitimately carries custom tags (`!ENV`, and `!!python/name:pymdownx...`
+      # for superfences/emoji — this repo's own mkdocs.yml has one), and
+      # yaml.safe_load raises ConstructorError on them. Composing never invokes a
+      # constructor, so any config Zensical can build is one this step can read.
+      # If PyYAML is unavailable we say so and fall back to a single-key text read
+      # rather than adding a pip install to a KB deploy.
+      - name: Resolve KB layout from mkdocs.yml
+        run: |
+          set -uo pipefail
+
+          if [ ! -f mkdocs.yml ]; then
+            echo "::error::No mkdocs.yml at repo root. A Glassdocs KB is Markdown: docs/*.md + mkdocs.yml."
+            exit 1
+          fi
+
+          # A top-level key's scalar value, read as text. Only reached when PyYAML
+          # is missing. Anchored at column 0 so a nested key of the same name
+          # (under a plugin, say) cannot be mistaken for the top-level one.
+          text_key() {
+            sed -n "s/^$1:[[:space:]]*//p" mkdocs.yml | head -n 1 \
+              | sed 's/[[:space:]]*#.*$//; s/[[:space:]]*$//' | tr -d "\"'"
+          }
+
+          PY=$(command -v python || command -v python3 || true)
+          rc=0
+          if [ -n "$PY" ]; then
+            layout=$("$PY" - <<'PY_EOF'
+          import sys
+          try:
+              import yaml
+          except ImportError:
+              sys.exit(4)
+          try:
+              root = yaml.compose(open("mkdocs.yml", encoding="utf-8"), Loader=yaml.SafeLoader)
+          except Exception as exc:
+              print(exc, file=sys.stderr)
+              sys.exit(3)
+          keys = {}
+          if isinstance(root, yaml.MappingNode):
+              for key, value in root.value:
+                  if isinstance(key, yaml.ScalarNode) and isinstance(value, yaml.ScalarNode):
+                      keys[key.value] = value.value
+          print(keys.get("docs_dir") or "docs")
+          print(keys.get("site_dir") or "site")
+          PY_EOF
+          ) || rc=$?
+          else
+            rc=4
+          fi
+
+          if [ "$rc" -eq 3 ]; then
+            echo "::error::mkdocs.yml could not be parsed as YAML, so this KB's docs_dir/site_dir are unknown. Refusing to guess — linting the wrong directory and publishing the wrong directory are both silent. Fix mkdocs.yml and re-run."
+            exit 1
+          fi
+          if [ "$rc" -ne 0 ]; then
+            echo "::warning::Could not read mkdocs.yml with PyYAML (exit ${rc}) — falling back to a text read of docs_dir/site_dir."
+            DOCS_DIR=$(text_key docs_dir)
+            DOCS_DIR=${DOCS_DIR:-docs}
+            SITE_DIR=$(text_key site_dir)
+            SITE_DIR=${SITE_DIR:-site}
+          else
+            DOCS_DIR=$(printf '%s\n' "$layout" | sed -n 1p)
+            SITE_DIR=$(printf '%s\n' "$layout" | sed -n 2p)
+          fi
+
+          # A directory that escapes the repo would point the lint at someone
+          # else's files and hand `pages deploy` an arbitrary path on a runner
+          # holding the Cloudflare token. Refuse before either happens.
+          for pair in "docs_dir:$DOCS_DIR" "site_dir:$SITE_DIR"; do
+            key=${pair%%:*}
+            val=${pair#*:}
+            case "$val" in
+              ""|/*|..|../*|*/..|*/../*)
+                echo "::error::mkdocs.yml sets ${key} to '${val}', which is empty or escapes the repository. Refusing: the publisher lints, injects into and deploys that directory."
+                exit 1 ;;
+            esac
+          done
+
+          {
+            echo "DOCS_DIR=$DOCS_DIR"
+            echo "SITE_DIR=$SITE_DIR"
+          } >> "$GITHUB_ENV"
+          echo "KB layout from mkdocs.yml: docs_dir=$DOCS_DIR site_dir=$SITE_DIR"
+
+      # Compliance lint on the Markdown source — fails the deploy on violations
+      # BEFORE any side effects. Markdown-only rules: a docs dir exists, a deploy
+      # workflow exists, no custom HTML is tracked, no commercial content unless
+      # allow-financial.
+      #
+      # $DOCS_DIR is deliberately NOT declared here: a step-level `env:` overrides
+      # $GITHUB_ENV, so pinning it to `docs` was what stopped the resolved value
+      # from ever reaching the lint (#152). It comes from the resolution step
+      # above, falling back to the job-level default.
+      - name: Run docs compliance lint
+        if: ${{ !inputs.skip-lint }}
+        env:
+          ALLOW_FINANCIAL: ${{ inputs.allow-financial }}
+        run: |
+          set -uo pipefail
+          out=$(bash _playbook/templates/search/scripts/docs-lint.sh) || rc=$?
+          rc=${rc:-0}
+          echo "$out" | while IFS= read -r line; do
+            case "$line" in
+              FAIL:*) echo "::error::${line#FAIL: }" ;;
+              WARN:*) echo "::warning::${line#WARN: }" ;;
+              *)      echo "$line" ;;
+            esac
+          done
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::Docs lint failed. See https://github.com/Glassdocs/glassdocs for playbook rules. Deploy blocked."
+            exit "$rc"
+          fi
 
       # Zensical reads the KB's mkdocs.yml unchanged. A KB may pin Zensical (or
       # extra plugins) via requirements.txt or docs/requirements.txt; if it ships
@@ -258,6 +376,15 @@ jobs:
           fi
           zensical build
 
+      # Nothing between `zensical build` and `pages deploy` proved that $SITE_DIR
+      # holds THIS run's output. The resolution above covers the common case; this
+      # covers the residue (a half-failed build, a site_dir the read could not
+      # follow) by turning "published the wrong tree" into a blocked deploy (#153).
+      - name: Verify the build produced a site
+        run: |
+          set -uo pipefail
+          [ -f "$SITE_DIR/index.html" ] || { echo "::error::zensical build produced no $SITE_DIR/index.html"; exit 1; }
+
       # Inject GlassDocs recognition meta (source-repo / source-path) into the
       # built HTML so the browser extension recognises this site and maps each
       # page to its Markdown source. Post-build + build-agnostic on purpose:
@@ -276,13 +403,38 @@ jobs:
         run: |
           node _playbook/templates/search/scripts/inject-source-meta.mjs \
             --repo "$REPO" \
-            --site "$SITE_DIR" --docs-dir docs
+            --site "$SITE_DIR" --docs-dir "$DOCS_DIR"
 
       # _headers (security headers + CSP) is a Cloudflare Pages control file and
       # must sit at the site root. It ALWAYS comes from the platform template —
       # security posture is not a per-KB choice.
       - name: Add security headers
         run: cp _playbook/templates/_headers "$SITE_DIR/_headers"
+
+      # The in-page read-aloud control (#187): a ▶ rendered INSIDE the published
+      # page, driving the reader's own speechSynthesis. It exists because the
+      # extension's read-aloud reaches only desktop Chrome — there is no Chrome
+      # extension on iOS and no MV3 side panel on Android Chrome — so before this,
+      # no phone could hear a KB page at all. Nothing is generated, fetched or
+      # stored: the audio is produced by the reader's browser and OS, and the
+      # script issues no network request of any kind.
+      #
+      # UNCONDITIONAL, and deliberately NOT gated on vars.AUDIO_ENABLED. That
+      # variable switches off the generation-and-storage pipeline below (Kokoro,
+      # Release assets, R2), which this route does not use — there is nothing for
+      # it to switch off here. Making the cp conditional would also make an absent
+      # platform asset a LEGITIMATE tenant state, and it never is: unlike the
+      # audio Release lookup, a missing file here is always a broken release, so
+      # `cp` failing the deploy is the correct and intended behaviour.
+      #
+      # A tenant who objects on brand grounds hides it with one rule on
+      # `#glassdocs-read-aloud` in their own extra_css — no platform surface, no
+      # per-repo configuration, which is the whole point of this route.
+      - name: Add the in-page read-aloud control
+        run: |
+          set -euo pipefail
+          mkdir -p "$SITE_DIR/assets"
+          cp _playbook/templates/read-aloud/read-aloud.js "$SITE_DIR/assets/glassdocs-read-aloud.js"
 
       # Pull this KB's generated page audio out of its GitHub Release and into
       # the site, so it ships as part of THIS deployment (#94).
@@ -339,16 +491,95 @@ jobs:
           AUTH="Authorization: Bearer ${AUDIO_TOKEN}"
           VSN="X-GitHub-Api-Version: 2022-11-28"
 
-          REL=$(curl -sS -H "$AUTH" -H "$VSN" -H "Accept: application/vnd.github+json" \
-                  --max-time 30 "${API}/repos/${AUDIO_REPO}/releases/tags/${AUDIO_TAG}" || echo '')
-          REL_ID=$(printf '%s' "$REL" | jq -r '.id // empty' 2>/dev/null || echo '')
+          # A lookup that FAILED is not a repo that has no release. `curl -sS`
+          # without --fail exits 0 on an HTTP 401/403/5xx and prints the API's
+          # error object ({"message":"Bad credentials"}), so `.id // empty` came
+          # back empty and the step asserted "no audio generated yet" — advice
+          # that sends a tenant to regenerate clips they already have, behind a
+          # green deploy with a silent site (#171). Same shape as the asset
+          # listing below before #159: an error folded into an empty result.
+          #
+          # --fail is NOT the fix. It makes 401 and 404 both exit non-zero,
+          # collapsing them again just into the other bucket, and it discards
+          # the body — and the API's `message` is the most useful thing to put
+          # in the warning. So take the status and the body separately.
+          REL_BODY="$(mktemp)"
+          REL_CODE=$(curl -sS -H "$AUTH" -H "$VSN" -H "Accept: application/vnd.github+json" \
+                       --max-time 30 -o "$REL_BODY" -w '%{http_code}' \
+                       "${API}/repos/${AUDIO_REPO}/releases/tags/${AUDIO_TAG}") || REL_CODE=''
+          # The API's own diagnosis, never the token. Absent on a transport failure.
+          REL_MSG=$(jq -r '.message // empty' <"$REL_BODY" 2>/dev/null || echo '')
+          case "${REL_CODE:-}" in
+            404)
+              # The legitimate case: this KB has never generated audio. Not a
+              # failure — the docs deploy carries on exactly as before.
+              echo "::notice::AUDIO_ENABLED is on but ${AUDIO_REPO} has no '${AUDIO_TAG}' release yet — nothing to publish. Generate audio from the Glassdocs admin first."
+              exit 0
+              ;;
+            2??)
+              ;;
+            *)
+              # 401/403/5xx, or curl failed/timed out. Abandon the audio step
+              # with a warning, matching the `list_ok=false` outcome below: a
+              # token that lost scope on a separate audio repo must not take
+              # down documentation publishing.
+              echo "::warning::Could not look up the '${AUDIO_TAG}' release in ${AUDIO_REPO} (HTTP ${REL_CODE:-none — curl failed or timed out}${REL_MSG:+ — ${REL_MSG}}) — publishing no audio this deploy. This is NOT 'no audio generated yet': check the token's access to ${AUDIO_REPO}."
+              exit 0
+              ;;
+          esac
+          REL_ID=$(jq -r '.id // empty' <"$REL_BODY" 2>/dev/null || echo '')
           if [ -z "$REL_ID" ]; then
-            echo "::notice::AUDIO_ENABLED is on but ${AUDIO_REPO} has no '${AUDIO_TAG}' release yet — nothing to publish. Generate audio from the Glassdocs admin first."
+            echo "::warning::The '${AUDIO_TAG}' release lookup in ${AUDIO_REPO} returned HTTP ${REL_CODE} with no release id — publishing no audio this deploy."
             exit 0
           fi
 
-          ASSETS=$(curl -sS -H "$AUTH" -H "$VSN" -H "Accept: application/vnd.github+json" \
-                     --max-time 30 "${API}/repos/${AUDIO_REPO}/releases/${REL_ID}/assets?per_page=100" || echo '[]')
+          # PAGE the asset listing. `per_page` is a page SIZE, never a pagination
+          # strategy: GitHub caps it at 100 and silently clamps anything larger
+          # (measured 2026-08-13 — `/repos/cli/cli/releases?per_page=150` returns
+          # 100). A KB page is TWO assets (<key>.opus + <key>.json), so one
+          # request only ever reached ~50 pages of the KB; past that the clips
+          # were simply absent, the reconciliation below dropped their sidecars,
+          # and the deploy went green with most of the KB silently mute (#159).
+          #
+          # A page that FAILS is not a page that is empty. The old `|| echo '[]'`
+          # made a network error indistinguishable from "this KB has no assets"
+          # and landed on "publish no audio" with no warning at all — so a failed
+          # request now says so and abandons the whole audio step, rather than
+          # publishing whichever prefix happened to arrive.
+          ASSETS='[]'
+          PAGE=1
+          list_ok=true
+          while :; do
+            PAGE_JSON=$(curl -sS -H "$AUTH" -H "$VSN" -H "Accept: application/vnd.github+json" \
+                          --max-time 30 "${API}/repos/${AUDIO_REPO}/releases/${REL_ID}/assets?per_page=100&page=${PAGE}") || PAGE_JSON=''
+            # An error object ({"message":"Bad credentials"}) is not an array, so
+            # `empty` leaves PAGE_N unset and it is treated as a failed page.
+            PAGE_N=$(printf '%s' "$PAGE_JSON" | jq -r 'if type == "array" then length else empty end' 2>/dev/null || echo '')
+            if [ -z "$PAGE_N" ]; then
+              echo "::warning::Could not list page ${PAGE} of the '${AUDIO_TAG}' release assets — publishing no audio this deploy."
+              list_ok=false
+              break
+            fi
+            ASSETS=$(printf '%s\n%s\n' "$ASSETS" "$PAGE_JSON" | jq -c -s 'add') || {
+              echo "::warning::Could not merge page ${PAGE} of the '${AUDIO_TAG}' release asset listing — publishing no audio this deploy."
+              list_ok=false
+              break
+            }
+            if [ "$PAGE_N" -lt 100 ]; then
+              break
+            fi
+            # Backstop against a listing that never comes back short. 50 pages is
+            # 5000 assets (2500 KB pages); stopping is still truncation, so it is
+            # loud rather than silent.
+            if [ "$PAGE" -ge 50 ]; then
+              echo "::warning::Stopped listing '${AUDIO_TAG}' release assets after ${PAGE} pages (5000 assets) — some pages will ship without audio."
+              break
+            fi
+            PAGE=$((PAGE + 1))
+          done
+          if [ "$list_ok" != "true" ]; then
+            exit 0
+          fi
 
           # Stage in a temp dir and only move it into the site once everything
           # downloaded. A half-fetched site/audio/ would serve truncated clips.
@@ -382,6 +613,13 @@ jobs:
             exit 0
           fi
 
+          # How many pages the release CLAIMS audio for, counted BEFORE the
+          # reconciliation below throws any of them away. The gap between this
+          # and the manifest is the tenant-visible symptom of a truncated read,
+          # and it has to be legible in the log: "40 of 90 pages shipped" is the
+          # sentence a tenant needs, and per-orphan warnings never added up to it.
+          SIDECARS=$(find "$META" -name 'gd-audio-*.json' | wc -l | tr -d ' ')
+
           # Drop any sidecar whose clip is missing or whose byte count disagrees
           # with the file we actually downloaded. The reader must never be handed
           # a manifest entry pointing at a 404 or at truncated audio.
@@ -409,7 +647,11 @@ jobs:
           # edited since, and #97 must say so rather than play stale audio.
           COUNT=$(find "$META" -name 'gd-audio-*.json' | wc -l | tr -d ' ')
           if [ "$COUNT" = "0" ]; then
-            echo "::notice::No usable audio clips on the '${AUDIO_TAG}' release — publishing no audio."
+            if [ "$SIDECARS" != "0" ]; then
+              echo "::warning::Audio: 0 of ${SIDECARS} page(s) on the '${AUDIO_TAG}' release survived reconciliation — publishing no audio."
+            else
+              echo "::notice::No usable audio clips on the '${AUDIO_TAG}' release — publishing no audio."
+            fi
             rm -rf "$STAGE" "$META"
             exit 0
           fi
@@ -434,6 +676,12 @@ jobs:
             exit 0
           fi
           COUNT=$(jq -r '.pages | length' "${STAGE}/manifest.json")
+          if [ "$COUNT" != "$SIDECARS" ]; then
+            # Still only a warning: audio is a derived artifact and blocking a
+            # documentation deploy over it would be the worse failure (see the
+            # step header). But the tenant can now read the shortfall directly.
+            echo "::warning::Audio: ${COUNT} of ${SIDECARS} page(s) on the '${AUDIO_TAG}' release made it into /audio/manifest.json — the rest are listed above and will ship without audio."
+          fi
           mkdir -p "${SITE_DIR}/audio"
           cp -R "${STAGE}/." "${SITE_DIR}/audio/"
           rm -rf "$STAGE" "$META"
@@ -1077,7 +1325,14 @@ jobs:
           # A first PUBLIC deploy races edge propagation exactly like the gated
           # one (#67) — the project won't answer for minutes, and a 4-attempt
           # window failed the deploy before the site ever had a chance to serve.
-          FIRST_DEPLOY: ${{ steps.access.outputs.access_ready == 'false' }}
+          #
+          # Deliberately NOT the gated step's `steps.access.outputs.access_ready`
+          # expression (#156). That step is `if: ${{ !inputs.public }}`, and this
+          # one only runs when `inputs.public` is true — mutually exclusive, so
+          # access_ready read as '' here, `'' == 'false'` was false, and the 300s
+          # branch below was unreachable for every public KB ever published.
+          # `ensure-project` runs in BOTH modes and is the only step that knows.
+          FIRST_DEPLOY: ${{ steps.ensure-project.outputs.created == 'true' }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |

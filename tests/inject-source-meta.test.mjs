@@ -75,22 +75,48 @@ test("attribute values are escaped so a crafted repo name cannot break out of th
 
 const never = () => false;
 const always = () => true;
+// EVERY candidate is now probed, so a test's `exists` stub decides the answer. The
+// cases below used `never` and still expected a path back, which encoded the #152
+// bug: the flat fallback (and the root index) were returned WITHOUT being probed,
+// so a KB whose docs_dir isn't `docs` had every page stamped with a docs/<x>.md
+// that does not exist. "Edit this" then committed a NEW file under docs/, which
+// the build never reads — the change published nothing and the repo accumulated
+// stray Markdown. An ABSENT source-path is fine (the resolver falls back to the
+// URL, already the behaviour for 404.html); a wrong one is not.
+const flatOnly = (p) => !p.endsWith("/index.md") || p === "docs/index.md";
 
-test("site/index.html maps to the docs root index", () => {
-  assert.equal(sourcePathFor("site/index.html", "site", "docs", never), "docs/index.md");
+test("site/index.html maps to the docs root index when it is there", () => {
+  assert.equal(sourcePathFor("site/index.html", "site", "docs", always), "docs/index.md");
+});
+
+test("the ROOT index.html is probed too — it used to be returned unchecked", () => {
+  // Not named in #152, which cited only the flat fallback: `rel === "index.html"`
+  // returned `docs/index.md` without asking whether it existed. A KB with
+  // docs_dir: content has no docs/index.md, so the home page — the one page every
+  // KB has — carried a wrong edit target.
+  assert.equal(sourcePathFor("site/index.html", "site", "docs", never), null);
+  assert.equal(
+    sourcePathFor("site/index.html", "site", "content", (p) => p === "content/index.md"),
+    "content/index.md",
+  );
 });
 
 test("site/foo/index.html prefers docs/foo/index.md when that section landing file exists", () => {
   assert.equal(sourcePathFor("site/foo/index.html", "site", "docs", always), "docs/foo/index.md");
 });
 
-test("site/foo/index.html falls back to docs/foo.md when there is no section landing file", () => {
-  assert.equal(sourcePathFor("site/foo/index.html", "site", "docs", never), "docs/foo.md");
+test("site/foo/index.html falls back to docs/foo.md when the flat file is the one on disk", () => {
+  assert.equal(sourcePathFor("site/foo/index.html", "site", "docs", flatOnly), "docs/foo.md");
 });
 
 test("nested pages keep their full path", () => {
-  assert.equal(sourcePathFor("site/a/b/index.html", "site", "docs", never), "docs/a/b.md");
+  assert.equal(sourcePathFor("site/a/b/index.html", "site", "docs", flatOnly), "docs/a/b.md");
   assert.equal(sourcePathFor("site/a/b/index.html", "site", "docs", always), "docs/a/b/index.md");
+});
+
+test("neither candidate on disk means NO source-path, not a guessed one", () => {
+  assert.equal(sourcePathFor("site/foo/index.html", "site", "docs", never), null);
+  assert.equal(sourcePathFor("site/a/b/index.html", "site", "docs", never), null);
 });
 
 test("a non-index page such as 404.html has no Markdown source", () => {
@@ -99,15 +125,39 @@ test("a non-index page such as 404.html has no Markdown source", () => {
 });
 
 test("a custom docs dir is honoured in the mapped source path", () => {
-  assert.equal(sourcePathFor("site/foo/index.html", "site", "documentation", never), "documentation/foo.md");
+  assert.equal(
+    sourcePathFor("site/foo/index.html", "site", "documentation", (p) => p === "documentation/foo.md"),
+    "documentation/foo.md",
+  );
 });
 
-test("the existence probe is asked about the SECTION landing file, not the flat file", () => {
+test("a non-default docs_dir resolves against ITS tree, and never claims anything under docs/", () => {
+  const inContent = (p) => p.startsWith("content/");
+  assert.equal(sourcePathFor("public/index.html", "public", "content", inContent), "content/index.md");
+  assert.equal(sourcePathFor("public/guide/index.html", "public", "content", inContent), "content/guide/index.md");
+  assert.equal(sourcePathFor("public/guide/index.html", "public", "content", (p) => p.startsWith("docs/")), null);
+});
+
+test("the existence probe is asked about the SECTION landing file FIRST, then the flat file", () => {
+  // Order matters: the section landing is the one that, guessed wrong, creates a
+  // stray sibling of a directory that already has an index. The flat file is now
+  // probed as well — that second probe IS the #152 fix, so asserting it is asked
+  // is asserting the fix is present.
   const asked = [];
   sourcePathFor("site/guides/index.html", "site", "docs", (p) => {
     asked.push(p);
     return false;
   });
+  assert.deepEqual(asked, ["docs/guides/index.md", "docs/guides.md"]);
+});
+
+test("probing stops at the section landing when it exists — the flat file is never asked about", () => {
+  const asked = [];
+  const got = sourcePathFor("site/guides/index.html", "site", "docs", (p) => {
+    asked.push(p);
+    return true;
+  });
+  assert.equal(got, "docs/guides/index.md");
   assert.deepEqual(asked, ["docs/guides/index.md"]);
 });
 

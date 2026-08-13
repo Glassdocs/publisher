@@ -53,6 +53,79 @@ test("HARD FAIL: a missing mkdocs.yml blocks the deploy (a KB is Markdown)", (t)
   assert.match(r.out, /^FAIL: No mkdocs\.yml at repo root/m);
 });
 
+// ── The docs directory must be THERE, and visible to git (#152, #172) ──
+//
+// Checks 4 and 5 are both guarded on `[ -d "$DOCS_DIR" ]`. Without check 3 a
+// missing — or git-invisible — docs dir took neither branch: `fails` stayed 0,
+// the script printed "docs-lint: passed", and the deploy went green with BOTH
+// hard checks silently skipped. A KB the lint could not look at is not a KB that
+// passed, and these tests are the only thing standing between that sentence and
+// a vacuous green. Each asserts the FAIL, then re-asserts that the pass line is
+// absent — because the bug's signature was a pass, not a wrong failure.
+
+test("HARD FAIL: no docs/ directory at all blocks the deploy (#152)", (t) => {
+  const files = kb();
+  delete files["docs/index.md"]; // nothing else puts docs/ on disk
+  const r = lint(files);
+  t.after(r.cleanup);
+
+  assert.equal(r.status, 1, r.out);
+  assert.match(r.out, /^FAIL: No docs\/ directory/m);
+  assert.doesNotMatch(r.out, /docs-lint: passed/, "a lint that could not look at the KB must not report a pass");
+});
+
+test("HARD FAIL: docs/ exists but nothing in it is tracked — gitignored or generated (#172)", (t) => {
+  // `[ -d ]` is satisfied and `git ls-files` prints nothing and exits 0, so
+  // checks 4 and 5 would look at an empty list and pass vacuously. Stage
+  // everything EXCEPT the Markdown to reproduce that exactly.
+  const files = kb();
+  const r = lint(files, { git: { "mkdocs.yml": 1, ".github/workflows/deploy.yml": 1 } });
+  t.after(r.cleanup);
+
+  assert.equal(r.status, 1, r.out);
+  assert.match(r.out, /^FAIL: docs\/ exists but has no committed files/m);
+  assert.doesNotMatch(r.out, /docs-lint: passed/);
+});
+
+test("HARD FAIL: an untracked docs/ hides a violation that would otherwise block — and is caught anyway (#172)", (t) => {
+  // The reason #172 matters rather than being a tidiness point: the same blind
+  // spot that skipped the checks also concealed real violations. Custom HTML
+  // under an untracked docs/ used to deploy green.
+  const files = kb({ "docs/custom.html": "<h1>hand-written</h1>" });
+  const r = lint(files, { git: { "mkdocs.yml": 1, ".github/workflows/deploy.yml": 1 } });
+  t.after(r.cleanup);
+
+  assert.equal(r.status, 1, r.out);
+  assert.doesNotMatch(r.out, /docs-lint: passed/);
+});
+
+test("HARD FAIL: the missing-directory check follows DOCS_DIR, not a hardcoded docs/", (t) => {
+  // The #152 case in its original form: the publisher passed DOCS_DIR=docs
+  // regardless, so a docs_dir: content KB was linted against a directory that
+  // was never there.
+  const files = kb();
+  delete files["docs/index.md"];
+  files["content/index.md"] = "# Home\n";
+  const r = lint(files, { env: { DOCS_DIR: "content" } });
+  t.after(r.cleanup);
+
+  assert.equal(r.status, 0, r.out);
+  assert.match(r.out, /docs-lint: passed/);
+});
+
+test("a tracked-content demand does NOT apply outside a git work tree (the carve-out is deliberate)", (t) => {
+  // list_under falls back to `find` there, so an empty dir is a fixture concern
+  // rather than a KB defect. Pinning this stops a future tightening from
+  // breaking the non-git path by accident.
+  const dir = fixtureTree(kb(), { git: false });
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  assert.equal(isGitRepo(dir), false, "fixture must not be inside a git work tree");
+
+  const res = runLint(dir);
+  assert.equal(res.status, 0, res.out);
+  assert.match(res.out, /docs-lint: passed/);
+});
+
 test("HARD FAIL: tracked HTML under docs/ blocks the deploy", (t) => {
   const r = lint(kb({ "docs/custom.html": "<h1>hand-written</h1>" }));
   t.after(r.cleanup);

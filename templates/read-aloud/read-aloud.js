@@ -1,5 +1,23 @@
 "use strict";
 (() => {
+  // src/content/read-aloud-signal.ts
+  var READ_ALOUD_STOP = "GLASSDOCS_READ_ALOUD_STOP";
+  var READ_ALOUD_STARTED = "GLASSDOCS_READ_ALOUD_STARTED";
+  function isReadAloudSignal(event, type) {
+    const w = globalThis.window;
+    if (!w || event.source !== w) return false;
+    if (event.origin !== globalThis.location?.origin) return false;
+    return event.data?.type === type;
+  }
+  function postReadAloudSignal(type) {
+    const w = globalThis.window;
+    if (!w) return;
+    try {
+      w.postMessage({ type }, globalThis.location?.origin ?? "/");
+    } catch {
+    }
+  }
+
   // src/content/readable-text.ts
   var FLOAT_BAR_ID = "glassdocs-float-bar";
   var READ_ALOUD_ID = "glassdocs-read-aloud";
@@ -321,6 +339,7 @@
       label: "Read aloud",
       start() {
         run++;
+        synth.cancel();
         pauseRequested = false;
         pausedByCancel = false;
         speakChunk(0);
@@ -459,9 +478,15 @@
     }
     const resolve = () => {
       const blocks = readableBlocks(mainContentRoot(doc));
-      return createSpeechSourceWith(blocks, voice);
+      const source = createSpeechSourceWith(blocks, voice);
+      if (source) postReadAloudSignal(READ_ALOUD_STARTED);
+      return source;
     };
     const transport = createTransport(resolve);
+    globalThis.window?.addEventListener("message", (event) => {
+      if (!isReadAloudSignal(event, READ_ALOUD_STOP)) return;
+      transport.stop();
+    });
     const playGlyph = playBtn.querySelector(`.${GLYPH_CLASS}`);
     transport.onStateChange((state) => {
       const playing = state === "playing";

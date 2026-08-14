@@ -30,7 +30,7 @@
 // answered with success:false naming the request, so a test that forgets a
 // route fails with a readable message rather than a silent hang.
 // ──────────────────────────────────────────────────────────────────────
-import { appendFileSync, readFileSync, existsSync } from "node:fs";
+import { appendFileSync, readFileSync, existsSync, writeFileSync } from "node:fs";
 
 const LOG = process.env.MOCK_CURL_LOG;
 const SCRIPT = process.env.MOCK_CURL_SCRIPT;
@@ -141,9 +141,17 @@ const payload =
   : route.body !== undefined ? JSON.stringify(route.body)
   : "";
 
-// `-o <file>` suppresses the body on stdout (only /dev/null is honoured; tests
-// never need a real capture file).
+// `-o <file>` suppresses the body on stdout and WRITES IT TO THE FILE, which is
+// the whole point of the `-o "$BODY" -w '%{http_code}'` idiom this suite now
+// exercises: the caller reads the status from stdout and the body from the file
+// separately, so a 401/403/5xx cannot be folded into "the thing is absent"
+// (Glassdocs/glassdocs#171, #239). The shim used to honour only /dev/null and
+// silently drop the payload, which would have made every such script look like
+// it got an EMPTY body — the exact failure the code under test is guarding
+// against, manufactured by the mock. A stub that cannot express the contract
+// under test is how glassdocs#67 survived its suite.
 if (!parsed.output) process.stdout.write(payload);
+else if (parsed.output !== "/dev/null") writeFileSync(parsed.output, payload);
 if (parsed.writeOut) {
   process.stdout.write(
     parsed.writeOut.replace(/%\{http_code\}/g, String(status)).replace(/\\n/g, "\n"),

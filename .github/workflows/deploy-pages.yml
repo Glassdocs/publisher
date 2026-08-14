@@ -813,10 +813,72 @@ jobs:
           # Access error 12130 "domain does not belong to zone". Query the real
           # subdomain when the project exists; fall back to the name-based domain only
           # on a true first deploy (project not created yet).
-          PROJ_JSON=$(curl -s "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/pages/projects/${PROJECT_NAME}" \
-            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}")
-          DOMAIN=$(printf '%s' "$PROJ_JSON" | jq -r '.result.subdomain // empty')
+          #
+          # ── A lookup that FAILED is not a project that is ABSENT (#239) ──
+          # This is the canonical copy of the resolver; three other steps below carry
+          # the same function and point back here.
+          #
+          # `curl -s` without --fail exits 0 on a 401/403/429/5xx and prints
+          # {"success":false,"errors":[…]} — so `.result.subdomain // empty` came back
+          # empty for EVERY failure, and this step announced "project not created yet"
+          # about a project that plainly exists, then guessed <name>.pages.dev. On a
+          # global pages.dev name collision that guess belongs BY DEFINITION to a
+          # DIFFERENT Cloudflare account, and $DOMAIN is what the Access app is created
+          # for, what the pre-flight gate check and the post-deploy verify probe, and
+          # therefore what a 200 makes this workflow roll back or DELETE a project over.
+          # Guessing a directory was already ruled out for being silently wrong (#228);
+          # guessing a domain can aim a delete at somebody else's site.
+          #
+          # Same conflation #171 fixed for the audio Release lookup above, same remedy:
+          # take the status and the body SEPARATELY. --fail is NOT the fix (see the
+          # note at that lookup) — it makes 401 and 404 both non-zero, collapsing the
+          # distinction again, and it discards the body, which is where Cloudflare's
+          # own `message` lives.
+          #
+          # Sets PAGES_SUBDOMAIN to the real subdomain, or to '' when Cloudflare says
+          # 404 — the ONLY answer that licenses a guess. Returns non-zero on anything
+          # else, including an empty status from a curl failure or timeout.
+          #
+          # It checks curl's exit status ITSELF rather than leaning on `set -e`: the
+          # four callers differ in their shell options, and the two that used to pipe
+          # curl straight into jq hid an HTTP failure completely (jq exits 0 on an
+          # error body) while a transport failure aborted the step under `pipefail`
+          # with nothing but curl's own stderr line — no annotation, no diagnosis.
+          PAGES_SUBDOMAIN=""
+          resolve_pages_subdomain() {
+            local body code msg
+            body="$(mktemp)"
+            code=$(curl -sS -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+                     --max-time 30 -o "$body" -w '%{http_code}' \
+                     "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/pages/projects/${PROJECT_NAME}") || code=''
+            case "${code:-}" in
+              404) PAGES_SUBDOMAIN=""; rm -f "$body"; return 0 ;;
+              2??) ;;
+              *)
+                # Cloudflare's own diagnosis, never the token (the preflight above
+                # deliberately prints only its length). Absent on a transport failure.
+                msg=$(jq -r '.errors[0].message // empty' <"$body" 2>/dev/null || echo '')
+                rm -f "$body"
+                echo "::error::Couldn't read the Cloudflare Pages project '${PROJECT_NAME}' (HTTP ${code:-none — curl failed or timed out}${msg:+ — ${msg}}). This is NOT 'the project doesn't exist yet': refusing to guess ${PROJECT_NAME}.pages.dev, because that domain decides which site gets the Access gate and which site the post-deploy check may roll back or delete. Check the API token has 'Cloudflare Pages: Read' on account ${CLOUDFLARE_ACCOUNT_ID}, then re-run."
+                return 1
+                ;;
+            esac
+            PAGES_SUBDOMAIN=$(jq -r '.result.subdomain // empty' <"$body" 2>/dev/null || echo '')
+            rm -f "$body"
+            if [ -z "$PAGES_SUBDOMAIN" ]; then
+              echo "::error::Cloudflare answered HTTP ${code} for Pages project '${PROJECT_NAME}' but the body carries no .result.subdomain. A malformed 200 is not an absent project — refusing to guess a domain. Re-run; if it persists, this is a Cloudflare API fault."
+              return 1
+            fi
+            return 0
+          }
+
+          resolve_pages_subdomain || exit 1
+          # Whether the project EXISTS, as distinct from whether we could look. The
+          # 12130 branch below needs the difference.
+          PROJECT_EXISTS=true
+          DOMAIN="$PAGES_SUBDOMAIN"
           if [ -z "$DOMAIN" ]; then
+            PROJECT_EXISTS=false
             DOMAIN="${PROJECT_NAME}.pages.dev"
             echo "Project not created yet — using name-based domain ${DOMAIN} for now."
           elif [ "$DOMAIN" != "${PROJECT_NAME}.pages.dev" ]; then
@@ -899,9 +961,34 @@ jobs:
               echo "access_ready=true" >> "$GITHUB_OUTPUT"
             else
               ERROR=$(echo "$CREATE_RESPONSE" | jq -r '.errors[0].message // "unknown"')
-              if echo "$ERROR" | grep -qE "domain does not belong to zone|internal_server_error"; then
-                echo "::warning::Pages project does not exist yet — Access app will be created after first deploy."
+              # 12130 "domain does not belong to zone" was reported as "Pages project
+              # does not exist yet" — a second conflation, of "we may not touch that
+              # domain" with "the project isn't there" (#239). The resolver above now
+              # KNOWS which it is, so the two separate:
+              #
+              #   PROJECT_EXISTS=false — Cloudflare told us 404. Access cannot bind an
+              #   app to a pages.dev domain that no project serves yet, so this is the
+              #   ordinary first deploy: defer to the post-deploy step, exactly as
+              #   before. Making 12130 unconditionally fatal would break every new KB.
+              #
+              #   PROJECT_EXISTS=true — the domain is real and this account still may
+              #   not have it: a global name collision, or the KB wired to the wrong
+              #   Cloudflare account. No retry fixes either, and carrying on means
+              #   access_ready=false, which SKIPS the policy sync AND the pre-flight
+              #   gate check and publishes ungated. Fail, naming the domain and the
+              #   account — the same verdict the first-deploy step already reaches for
+              #   12130 three hundred lines below.
+              if echo "$ERROR" | grep -q "internal_server_error"; then
+                echo "::warning::Cloudflare returned a transient internal error creating the Access app for ${DOMAIN} — deferring to the post-deploy step, which retries."
                 echo "access_ready=false" >> "$GITHUB_OUTPUT"
+              elif echo "$ERROR" | grep -q "domain does not belong to zone"; then
+                if [ "$PROJECT_EXISTS" = "false" ]; then
+                  echo "::warning::Pages project does not exist yet — Access app will be created after first deploy."
+                  echo "access_ready=false" >> "$GITHUB_OUTPUT"
+                else
+                  echo "::error::Cloudflare says ${DOMAIN} does not belong to account ${CLOUDFLARE_ACCOUNT_ID} (Access error 12130) — but the Pages project '${PROJECT_NAME}' EXISTS and is served at that domain. That is a global pages.dev name collision, or this KB is wired to the wrong Cloudflare account; retrying cannot fix either. Fix: delete this Pages project and redeploy once the plain name is free, or reconnect the KB to the account that owns the domain. Refusing to continue — an ungated deploy would skip both the policy sync and the pre-flight gate check."
+                  echo "$CREATE_RESPONSE" >&2; exit 1
+                fi
               else
                 echo "::error::Failed to create Access app: $ERROR"
                 echo "$CREATE_RESPONSE" >&2; exit 1
@@ -925,9 +1012,38 @@ jobs:
         run: |
           set -euo pipefail
           echo "::notice::PUBLIC MODE — this KB deploys with NO Cloudflare Access gate (explicit 'public: true')."
-          PROJ_JSON=$(curl -s "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/pages/projects/${PROJECT_NAME}" \
-            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}")
-          DOMAIN=$(printf '%s' "$PROJ_JSON" | jq -r '.result.subdomain // empty')
+          # The Pages-project resolver — canonical copy and the full rationale are in
+          # the 'Ensure Cloudflare Access app' step above (#239). Duplicated rather
+          # than shared because the steps of a reusable workflow share no shell, and
+          # the shared-script checkout (_playbook) is not part of this release set.
+          PAGES_SUBDOMAIN=""
+          resolve_pages_subdomain() {
+            local body code msg
+            body="$(mktemp)"
+            code=$(curl -sS -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+                     --max-time 30 -o "$body" -w '%{http_code}' \
+                     "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/pages/projects/${PROJECT_NAME}") || code=''
+            case "${code:-}" in
+              404) PAGES_SUBDOMAIN=""; rm -f "$body"; return 0 ;;
+              2??) ;;
+              *)
+                msg=$(jq -r '.errors[0].message // empty' <"$body" 2>/dev/null || echo '')
+                rm -f "$body"
+                echo "::error::Couldn't read the Cloudflare Pages project '${PROJECT_NAME}' (HTTP ${code:-none — curl failed or timed out}${msg:+ — ${msg}}). This is NOT 'the project doesn't exist yet': refusing to guess ${PROJECT_NAME}.pages.dev, because that domain decides which site gets the Access gate and which site the post-deploy check may roll back or delete. Check the API token has 'Cloudflare Pages: Read' on account ${CLOUDFLARE_ACCOUNT_ID}, then re-run."
+                return 1
+                ;;
+            esac
+            PAGES_SUBDOMAIN=$(jq -r '.result.subdomain // empty' <"$body" 2>/dev/null || echo '')
+            rm -f "$body"
+            if [ -z "$PAGES_SUBDOMAIN" ]; then
+              echo "::error::Cloudflare answered HTTP ${code} for Pages project '${PROJECT_NAME}' but the body carries no .result.subdomain. A malformed 200 is not an absent project — refusing to guess a domain. Re-run; if it persists, this is a Cloudflare API fault."
+              return 1
+            fi
+            return 0
+          }
+
+          resolve_pages_subdomain || exit 1
+          DOMAIN="$PAGES_SUBDOMAIN"
           if [ -z "$DOMAIN" ]; then
             DOMAIN="${PROJECT_NAME}.pages.dev"
             echo "Project not created yet — using name-based domain ${DOMAIN} for now."
@@ -1136,9 +1252,47 @@ jobs:
           # which is what the site is really served at (Cloudflare may have assigned a
           # collision suffix, e.g. <name>-xyz.pages.dev). Protecting anything else
           # yields Access error 12130 forever.
-          REAL=$(curl -s "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/pages/projects/${PROJECT_NAME}" \
-            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" | jq -r '.result.subdomain // empty')
-          [ -n "$REAL" ] && DOMAIN="$REAL"
+          #
+          # This was the weakest of the four lookups and the one nearest the damage:
+          # it piped curl straight into jq, so an HTTP 401/403/5xx produced an empty
+          # $REAL (jq exits 0 on an error body), `[ -n "$REAL" ] && DOMAIN="$REAL"`
+          # silently kept the earlier GUESS, and that guess became `real_domain` —
+          # the domain the post-deploy verify probes and the rollback/delete acts on
+          # (#239). The resolver below refuses to guess instead.
+          #
+          # Canonical copy and the full rationale are in 'Ensure Cloudflare Access
+          # app' above. Duplicated because the steps of a reusable workflow share no
+          # shell.
+          PAGES_SUBDOMAIN=""
+          resolve_pages_subdomain() {
+            local body code msg
+            body="$(mktemp)"
+            code=$(curl -sS -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+                     --max-time 30 -o "$body" -w '%{http_code}' \
+                     "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/pages/projects/${PROJECT_NAME}") || code=''
+            case "${code:-}" in
+              404) PAGES_SUBDOMAIN=""; rm -f "$body"; return 0 ;;
+              2??) ;;
+              *)
+                msg=$(jq -r '.errors[0].message // empty' <"$body" 2>/dev/null || echo '')
+                rm -f "$body"
+                echo "::error::Couldn't read the Cloudflare Pages project '${PROJECT_NAME}' (HTTP ${code:-none — curl failed or timed out}${msg:+ — ${msg}}). This is NOT 'the project doesn't exist yet': refusing to guess ${PROJECT_NAME}.pages.dev, because that domain decides which site gets the Access gate and which site the post-deploy check may roll back or delete. Check the API token has 'Cloudflare Pages: Read' on account ${CLOUDFLARE_ACCOUNT_ID}, then re-run."
+                return 1
+                ;;
+            esac
+            PAGES_SUBDOMAIN=$(jq -r '.result.subdomain // empty' <"$body" 2>/dev/null || echo '')
+            rm -f "$body"
+            if [ -z "$PAGES_SUBDOMAIN" ]; then
+              echo "::error::Cloudflare answered HTTP ${code} for Pages project '${PROJECT_NAME}' but the body carries no .result.subdomain. A malformed 200 is not an absent project — refusing to guess a domain. Re-run; if it persists, this is a Cloudflare API fault."
+              return 1
+            fi
+            return 0
+          }
+
+          resolve_pages_subdomain || exit 1
+          # A 404 here means the project STILL isn't there after a deploy — keep the
+          # inherited name-based domain and let the create below report the truth.
+          if [ -n "$PAGES_SUBDOMAIN" ]; then DOMAIN="$PAGES_SUBDOMAIN"; fi
           # Export the REAL subdomain IMMEDIATELY — before any create attempt —
           # so the post-deploy verify/rollback probes the domain the site is
           # actually served at even when Access-app creation fails below. The
@@ -1409,9 +1563,40 @@ jobs:
           set -euo pipefail
           # Re-resolve the REAL subdomain now that the project certainly exists
           # (on a first deploy the pre-deploy step only had the name-based guess).
-          DOMAIN=$(curl -s "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/pages/projects/${PROJECT_NAME}" \
-            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" | jq -r '.result.subdomain // empty')
-          [ -z "$DOMAIN" ] && DOMAIN="${PROJECT_NAME}.pages.dev"
+          # This step decides which site a 200 is read off and reported live, so a
+          # failed lookup must not fall back to a guess: on a collision the guess is
+          # another account's site, and "it answered 200" would be a claim about
+          # somebody else's KB (#239). Canonical resolver: 'Ensure Cloudflare Access
+          # app' above.
+          PAGES_SUBDOMAIN=""
+          resolve_pages_subdomain() {
+            local body code msg
+            body="$(mktemp)"
+            code=$(curl -sS -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+                     --max-time 30 -o "$body" -w '%{http_code}' \
+                     "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/pages/projects/${PROJECT_NAME}") || code=''
+            case "${code:-}" in
+              404) PAGES_SUBDOMAIN=""; rm -f "$body"; return 0 ;;
+              2??) ;;
+              *)
+                msg=$(jq -r '.errors[0].message // empty' <"$body" 2>/dev/null || echo '')
+                rm -f "$body"
+                echo "::error::Couldn't read the Cloudflare Pages project '${PROJECT_NAME}' (HTTP ${code:-none — curl failed or timed out}${msg:+ — ${msg}}). This is NOT 'the project doesn't exist yet': refusing to guess ${PROJECT_NAME}.pages.dev, because that domain decides which site gets the Access gate and which site the post-deploy check may roll back or delete. Check the API token has 'Cloudflare Pages: Read' on account ${CLOUDFLARE_ACCOUNT_ID}, then re-run."
+                return 1
+                ;;
+            esac
+            PAGES_SUBDOMAIN=$(jq -r '.result.subdomain // empty' <"$body" 2>/dev/null || echo '')
+            rm -f "$body"
+            if [ -z "$PAGES_SUBDOMAIN" ]; then
+              echo "::error::Cloudflare answered HTTP ${code} for Pages project '${PROJECT_NAME}' but the body carries no .result.subdomain. A malformed 200 is not an absent project — refusing to guess a domain. Re-run; if it persists, this is a Cloudflare API fault."
+              return 1
+            fi
+            return 0
+          }
+
+          resolve_pages_subdomain || exit 1
+          DOMAIN="$PAGES_SUBDOMAIN"
+          if [ -z "$DOMAIN" ]; then DOMAIN="${PROJECT_NAME}.pages.dev"; fi
           # Same test seam as the gated check above; defaults are the shipped values.
           BUDGET="${VERIFY_BUDGET_SECONDS:-60}"
           if [ "${FIRST_DEPLOY}" = "true" ]; then

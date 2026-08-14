@@ -343,7 +343,7 @@
         if (mine !== run) return;
         const code = event?.error;
         if (code === "canceled" || code === "interrupted") {
-          if (!pauseRequested) for (const fn of [...yieldFns]) fn();
+          for (const fn of [...yieldFns]) fn();
           return;
         }
         for (const fn of [...errorFns]) fn(String(code ?? "speech failed"));

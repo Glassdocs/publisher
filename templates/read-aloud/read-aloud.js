@@ -178,6 +178,11 @@
         if (source !== next) return;
         set("ended");
       });
+      next.onYielded?.(() => {
+        if (source !== next) return;
+        source = null;
+        set("idle");
+      });
       next.onError((message) => {
         if (source !== next) return;
         onDiagnostic?.("read-aloud source error", { message });
@@ -215,6 +220,10 @@
       },
       stop() {
         drop();
+        set("idle");
+      },
+      yieldTo() {
+        source = null;
         set("idle");
       },
       onStateChange(fn) {
@@ -316,6 +325,7 @@
     let pausedByCancel = false;
     const endedFns = [];
     const errorFns = [];
+    const yieldFns = [];
     const speakChunk = (i) => {
       if (i >= chunks.length) {
         for (const fn of [...endedFns]) fn();
@@ -332,7 +342,10 @@
       utterance.onerror = (event) => {
         if (mine !== run) return;
         const code = event?.error;
-        if (code === "canceled" || code === "interrupted") return;
+        if (code === "canceled" || code === "interrupted") {
+          if (!pauseRequested) for (const fn of [...yieldFns]) fn();
+          return;
+        }
         for (const fn of [...errorFns]) fn(String(code ?? "speech failed"));
       };
       synth.speak(utterance);
@@ -385,6 +398,9 @@
       },
       onError(fn) {
         errorFns.push(fn);
+      },
+      onYielded(fn) {
+        yieldFns.push(fn);
       }
     };
   }

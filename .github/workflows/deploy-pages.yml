@@ -233,15 +233,33 @@ jobs:
       # LATER step, so the lint, the meta injector, the audio copy, the headers
       # copy and `pages deploy` all follow this one answer.
       #
-      # No new runner dependency: PyYAML is already installed (Zensical depends on
-      # it) and `Set up Python` ran above. The read COMPOSES the YAML rather than
-      # loading it, and that is load-bearing: a Material-flavoured mkdocs.yml
-      # legitimately carries custom tags (`!ENV`, and `!!python/name:pymdownx...`
-      # for superfences/emoji — this repo's own mkdocs.yml has one), and
-      # yaml.safe_load raises ConstructorError on them. Composing never invokes a
-      # constructor, so any config Zensical can build is one this step can read.
-      # If PyYAML is unavailable we say so and fall back to a single-key text read
-      # rather than adding a pip install to a KB deploy.
+      # This step INSTALLS PyYAML, because it is not here yet. The comment that
+      # used to sit here said "PyYAML is already installed (Zensical depends on it)
+      # and `Set up Python` ran above", and that was false for every deploy this
+      # workflow has ever run: `Set up Python` puts a fresh setup-python
+      # interpreter first on PATH carrying pip/setuptools/wheel and nothing else,
+      # while Zensical — and with it PyYAML — arrives at `Install site generator`
+      # over a hundred lines below. Measured on Glassdocs/docs run 31773404608:
+      # `exit 4 — falling back to a text read` at 05:34:13, `Successfully
+      # installed … pyyaml-6.0.3` at 05:34:20. The wheel is in the pip cache that
+      # `Set up Python` just restored, so the install is a cached, ~1 s no-op that
+      # Zensical repeats later anyway (#228).
+      #
+      # There is exactly ONE reader, and it is fail-closed. The text fallback that
+      # used to stand behind it is deleted: it was not a safety net but the only
+      # thing that ever ran, and it made the `rc=3` refusal below unreachable in
+      # production. The two disagreed on real input — an unparseable mkdocs.yml
+      # gave `exit 1 + ::error::` under an interpreter with PyYAML and `exit 0,
+      # DOCS_DIR=docs SITE_DIR=public` under the one the deploy actually used,
+      # guessing a layout out of a file nobody could parse. A KB whose mkdocs.yml
+      # does not parse now FAILS rather than deploying a guess; that is the point.
+      #
+      # The read COMPOSES the YAML rather than loading it, and that is
+      # load-bearing: a Material-flavoured mkdocs.yml legitimately carries custom
+      # tags (`!ENV`, and `!!python/name:pymdownx...` for superfences/emoji — this
+      # repo's own mkdocs.yml has one), and yaml.safe_load raises ConstructorError
+      # on them. Composing never invokes a constructor, so any config Zensical can
+      # build is one this step can read.
       - name: Resolve KB layout from mkdocs.yml
         run: |
           set -uo pipefail
@@ -251,18 +269,24 @@ jobs:
             exit 1
           fi
 
-          # A top-level key's scalar value, read as text. Only reached when PyYAML
-          # is missing. Anchored at column 0 so a nested key of the same name
-          # (under a plugin, say) cannot be mistaken for the top-level one.
-          text_key() {
-            sed -n "s/^$1:[[:space:]]*//p" mkdocs.yml | head -n 1 \
-              | sed 's/[[:space:]]*#.*$//; s/[[:space:]]*$//' | tr -d "\"'"
-          }
-
           PY=$(command -v python || command -v python3 || true)
+          if [ -z "$PY" ]; then
+            echo "::error::No Python interpreter on PATH, so mkdocs.yml cannot be parsed and this KB's docs_dir/site_dir are unknown. Refusing to guess."
+            exit 1
+          fi
+
+          # Best-effort, because the IMPORT below is the gate — not this. A KB
+          # whose runner already has PyYAML skips it (and so does the test suite,
+          # which must not mutate a developer's site-packages); a KB whose install
+          # fails still gets a hard, named failure a few lines down rather than a
+          # silently guessed layout.
+          if ! "$PY" -c 'import yaml' >/dev/null 2>&1; then
+            echo "Installing PyYAML to read mkdocs.yml (setup-python ships a bare interpreter)."
+            "$PY" -m pip install --quiet --disable-pip-version-check "pyyaml>=6" || true
+          fi
+
           rc=0
-          if [ -n "$PY" ]; then
-            layout=$("$PY" - <<'PY_EOF'
+          layout=$("$PY" - <<'PY_EOF'
           import sys
           try:
               import yaml
@@ -282,24 +306,21 @@ jobs:
           print(keys.get("site_dir") or "site")
           PY_EOF
           ) || rc=$?
-          else
-            rc=4
-          fi
 
           if [ "$rc" -eq 3 ]; then
             echo "::error::mkdocs.yml could not be parsed as YAML, so this KB's docs_dir/site_dir are unknown. Refusing to guess — linting the wrong directory and publishing the wrong directory are both silent. Fix mkdocs.yml and re-run."
             exit 1
           fi
-          if [ "$rc" -ne 0 ]; then
-            echo "::warning::Could not read mkdocs.yml with PyYAML (exit ${rc}) — falling back to a text read of docs_dir/site_dir."
-            DOCS_DIR=$(text_key docs_dir)
-            DOCS_DIR=${DOCS_DIR:-docs}
-            SITE_DIR=$(text_key site_dir)
-            SITE_DIR=${SITE_DIR:-site}
-          else
-            DOCS_DIR=$(printf '%s\n' "$layout" | sed -n 1p)
-            SITE_DIR=$(printf '%s\n' "$layout" | sed -n 2p)
+          if [ "$rc" -eq 4 ]; then
+            echo "::error::PyYAML is not available to read mkdocs.yml, so this KB's docs_dir/site_dir are unknown. Refusing to guess — linting the wrong directory and publishing the wrong directory are both silent. The install above failed; re-run the deploy."
+            exit 1
           fi
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::Reading mkdocs.yml failed (exit ${rc}), so this KB's docs_dir/site_dir are unknown. Refusing to guess."
+            exit 1
+          fi
+          DOCS_DIR=$(printf '%s\n' "$layout" | sed -n 1p)
+          SITE_DIR=$(printf '%s\n' "$layout" | sed -n 2p)
 
           # A directory that escapes the repo would point the lint at someone
           # else's files and hand `pages deploy` an arbitrary path on a runner

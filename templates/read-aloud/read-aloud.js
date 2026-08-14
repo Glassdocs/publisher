@@ -152,6 +152,104 @@
     return ctx.out;
   }
 
+  // src/lib/published-audio.ts
+  var AUDIO_FILE_RE = /^\/audio\/gd-audio-[0-9a-f]{20}\.[A-Za-z0-9]+$/;
+  var SHA_RE = /^[0-9a-f]{40}$/;
+  function metaContent(doc, name, pattern) {
+    const raw = doc.querySelector(`meta[name="${name}"]`)?.getAttribute("content");
+    if (typeof raw !== "string" || !pattern.test(raw)) return null;
+    return raw;
+  }
+  function readAudioMetaFromDom(doc) {
+    return {
+      file: metaContent(doc, "audio-file", AUDIO_FILE_RE),
+      audioSha: metaContent(doc, "audio-sha", SHA_RE),
+      pageSha: metaContent(doc, "source-sha", SHA_RE)
+    };
+  }
+  function resolvePublishedAudio(file, audioSha, pageSha) {
+    if (typeof file !== "string" || !AUDIO_FILE_RE.test(file)) return { state: "none" };
+    if (typeof audioSha !== "string" || !SHA_RE.test(audioSha)) return { state: "none" };
+    if (typeof pageSha !== "string" || !SHA_RE.test(pageSha)) return { state: "none" };
+    if (audioSha !== pageSha) return { state: "stale" };
+    return { state: "play", file };
+  }
+  function mimeForClip(file) {
+    if (typeof file !== "string") return null;
+    const dot = file.lastIndexOf(".");
+    if (dot < 0) return null;
+    switch (file.slice(dot + 1).toLowerCase()) {
+      case "opus":
+        return "audio/ogg; codecs=opus";
+      case "mp3":
+        return "audio/mpeg";
+      default:
+        return null;
+    }
+  }
+
+  // src/sidepanel/clip-source.ts
+  var CLIP_LABEL = "AI voice";
+  function createClipSource(doc, url) {
+    const el = doc.createElement("audio");
+    el.preload = "none";
+    el.src = url;
+    const endedFns = [];
+    const errorFns = [];
+    let live = false;
+    const fail = (why) => {
+      if (!live) return;
+      live = false;
+      for (const fn of [...errorFns]) fn(why);
+    };
+    el.addEventListener("ended", () => {
+      if (!live) return;
+      live = false;
+      for (const fn of [...endedFns]) fn();
+    });
+    el.addEventListener("error", () => {
+      fail(`clip playback failed (media error ${el.error?.code ?? "unknown"})`);
+    });
+    return {
+      label: CLIP_LABEL,
+      start() {
+        live = true;
+        el.currentTime = 0;
+        const p = el.play();
+        if (p && typeof p.catch === "function") {
+          p.catch((e) => {
+            fail(`clip playback was refused (${e instanceof Error ? e.message : String(e)})`);
+          });
+        }
+      },
+      pause() {
+        el.pause();
+      },
+      resume() {
+        const p = el.play();
+        if (p && typeof p.catch === "function") {
+          p.catch((e) => {
+            fail(`clip playback was refused (${e instanceof Error ? e.message : String(e)})`);
+          });
+        }
+      },
+      stop() {
+        live = false;
+        el.pause();
+        el.currentTime = 0;
+        el.removeAttribute("src");
+        el.load();
+      },
+      onEnded(fn) {
+        endedFns.push(fn);
+      },
+      onError(fn) {
+        errorFns.push(fn);
+      }
+      // onYielded is deliberately absent — see the header.
+    };
+  }
+
   // src/sidepanel/read-aloud.ts
   var isThenable = (v) => typeof v?.then === "function";
   function createTransport(resolve, onDiagnostic) {
@@ -411,7 +509,10 @@
   var STOP = "\u23F9";
   var READ_TITLE = "Read this page aloud with a speech voice installed on your device";
   var LISTEN = "Listen";
+  var AI = "AI";
+  var AI_TITLE = "Play the AI-generated narration of this page";
   var LABEL_CLASS = "glassdocs-ra-label";
+  var AI_LABEL_CLASS = "glassdocs-ra-ai-label";
   var GLYPH_CLASS = "glassdocs-ra-glyph";
   var BUTTON_STYLE = [
     "font:inherit",
@@ -448,6 +549,13 @@
     el.append(g);
     return el;
   }
+  function labelSpan(doc, text, cls, inHeader) {
+    const label = doc.createElement("span");
+    label.className = cls;
+    label.textContent = text;
+    label.style.cssText = inHeader ? "font-size:.7rem;letter-spacing:-.025em" : "margin-left:0.4em";
+    return label;
+  }
   function resolveSlot(doc, root) {
     const palette = doc.querySelector('form.md-header__option[data-md-component="palette"]');
     if (palette?.parentNode) {
@@ -473,7 +581,7 @@
     style.textContent = HEADER_CSS;
     host.appendChild(style);
   }
-  function mount(doc, root, voice, reason) {
+  function mount(doc, root, voice, reason, clip) {
     const slot = resolveSlot(doc, root);
     const inHeader = slot.placement === "header";
     const bar = doc.createElement("div");
@@ -482,29 +590,44 @@
     bar.style.cssText = inHeader ? "display:flex;align-items:center;margin:0" : "display:flex;gap:0.4em;align-items:center;margin:0 0 1.2em";
     const title = voice ? READ_TITLE : reason ?? READ_TITLE;
     const playBtn = button(doc, PLAY, title, inHeader ? HEADER_PLAY_STYLE : BUTTON_STYLE);
+    const aiBtn = clip ? button(doc, PLAY, AI_TITLE, inHeader ? HEADER_PLAY_STYLE : BUTTON_STYLE) : null;
     const stopBtn = button(doc, STOP, "Stop reading", inHeader ? HEADER_BUTTON_STYLE : BUTTON_STYLE);
     if (inHeader) {
       playBtn.className = "md-header__button";
+      if (aiBtn) aiBtn.className = "md-header__button";
       stopBtn.className = "md-header__button";
       injectHeaderStyle(doc);
     }
-    const label = doc.createElement("span");
-    label.className = LABEL_CLASS;
-    label.textContent = LISTEN;
-    label.style.cssText = inHeader ? "font-size:.7rem;letter-spacing:-.025em" : "margin-left:0.4em";
-    playBtn.append(label);
+    playBtn.append(labelSpan(doc, LISTEN, LABEL_CLASS, inHeader));
+    if (aiBtn) aiBtn.append(labelSpan(doc, AI, AI_LABEL_CLASS, inHeader));
     stopBtn.hidden = true;
-    bar.append(playBtn, stopBtn);
+    if (aiBtn) bar.append(playBtn, aiBtn, stopBtn);
+    else bar.append(playBtn, stopBtn);
     if (!voice) {
       playBtn.disabled = true;
       playBtn.style.cssText = inHeader ? HEADER_DISABLED_STYLE : DISABLED_STYLE;
+    }
+    if (!voice && !clip) {
       slot.parent.insertBefore(bar, slot.before);
       return;
     }
+    let pending = voice ? "tts" : "clip";
+    let active = null;
     const resolve = () => {
+      if (pending === "clip") {
+        if (!clip) return null;
+        const source2 = createClipSource(doc, clip.file);
+        active = "clip";
+        postReadAloudSignal(READ_ALOUD_STARTED);
+        return source2;
+      }
+      if (!voice) return null;
       const blocks = readableBlocks(mainContentRoot(doc));
       const source = createSpeechSourceWith(blocks, voice);
-      if (source) postReadAloudSignal(READ_ALOUD_STARTED);
+      if (source) {
+        active = "tts";
+        postReadAloudSignal(READ_ALOUD_STARTED);
+      }
       return source;
     };
     const transport = createTransport(resolve);
@@ -513,34 +636,57 @@
       transport.stop();
     });
     const playGlyph = playBtn.querySelector(`.${GLYPH_CLASS}`);
+    const aiGlyph = aiBtn ? aiBtn.querySelector(`.${GLYPH_CLASS}`) : null;
+    const paint = (btn, glyphEl, resting, mine, state) => {
+      const isActive = active === mine;
+      const playing = isActive && state === "playing";
+      if (glyphEl) glyphEl.textContent = playing ? PAUSE : PLAY;
+      const next = playing ? "Pause reading" : isActive && state === "paused" ? "Resume reading" : resting;
+      btn.title = next;
+      btn.setAttribute("aria-label", next);
+    };
     transport.onStateChange((state) => {
-      const playing = state === "playing";
-      if (playGlyph) playGlyph.textContent = playing ? PAUSE : PLAY;
-      const next = playing ? "Pause reading" : state === "paused" ? "Resume reading" : READ_TITLE;
-      playBtn.title = next;
-      playBtn.setAttribute("aria-label", next);
-      stopBtn.hidden = !(playing || state === "paused");
+      if (state === "idle" || state === "ended") active = null;
+      paint(playBtn, playGlyph, title, "tts", state);
+      if (aiBtn) paint(aiBtn, aiGlyph, AI_TITLE, "clip", state);
+      stopBtn.hidden = !(state === "playing" || state === "paused");
     });
-    playBtn.addEventListener("click", () => {
+    const startWith = (which) => {
+      if (active && active !== which) transport.stop();
+      pending = which;
       void transport.toggle();
-    });
+    };
+    if (voice) playBtn.addEventListener("click", () => startWith("tts"));
+    if (aiBtn) aiBtn.addEventListener("click", () => startWith("clip"));
     stopBtn.addEventListener("click", () => transport.stop());
     globalThis.window?.addEventListener("pagehide", () => transport.stop());
     slot.parent.insertBefore(bar, slot.before);
   }
+  function resolveClip(doc) {
+    const meta = readAudioMetaFromDom(doc);
+    const verdict = resolvePublishedAudio(meta.file, meta.audioSha, meta.pageSha);
+    if (verdict.state !== "play" || !verdict.file) return null;
+    const mime = mimeForClip(verdict.file);
+    if (!mime) return null;
+    const probe = doc.createElement("audio");
+    if (typeof probe.canPlayType !== "function") return null;
+    if (probe.canPlayType(mime) === "") return null;
+    return { file: verdict.file };
+  }
   async function initReadAloudPage(doc = document) {
     const root = mainContentRoot(doc);
     if (!root) return false;
+    const clip = resolveClip(doc);
     if (toChunks(readableBlocks(root)).length === 0) {
-      mount(doc, root, null, NOTHING_TO_READ);
+      mount(doc, root, null, NOTHING_TO_READ, clip);
       return true;
     }
     const voice = await resolveLocalVoice();
     if (!voice) {
-      mount(doc, root, null, NO_LOCAL_VOICE);
+      mount(doc, root, null, NO_LOCAL_VOICE, clip);
       return true;
     }
-    mount(doc, root, voice, null);
+    mount(doc, root, voice, null, clip);
     return true;
   }
   if (typeof document !== "undefined") {

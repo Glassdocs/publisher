@@ -406,117 +406,30 @@ jobs:
           set -uo pipefail
           [ -f "$SITE_DIR/index.html" ] || { echo "::error::zensical build produced no $SITE_DIR/index.html"; exit 1; }
 
-      # Inject GlassDocs recognition meta (source-repo / source-path) into the
-      # built HTML so the browser extension recognises this site and maps each
-      # page to its Markdown source. Post-build + build-agnostic on purpose:
-      # Zensical rewrote theming, so mkdocs-material template overrides are a
-      # no-op — the repo identity is a deploy-time fact, injected here where CI
-      # actually knows it. Non-fatal if the repo can't be determined.
-      - name: Inject GlassDocs recognition meta
-        env:
-          # Env-indirection, NOT `${{ }}` inlined into the script line: source-repo
-          # is an unvalidated workflow_call input, and bash re-evaluates inlined
-          # interpolation, so inlining it would allow shell injection on the runner
-          # that later holds SOURCE_TOKEN + the Cloudflare token. Passed as $REPO,
-          # the value is data, never code. (The injector also validates the format
-          # and bails safely if it isn't OWNER/NAME.)
-          REPO: ${{ inputs.source-repo != '' && inputs.source-repo || github.repository }}
-          # #210 — the publisher release that built this page. `@v1` is a moving
-          # pointer: it moved three times in 26 hours and the released artefact
-          # recorded nothing, so "which publisher release built this KB?" could
-          # only be answered from a tenant's checkout log, which expires and which
-          # no reader of a published page can reach.
-          #
-          # These MUST be step-level. The contexts reference's availability table
-          # lists `job` under `jobs.<job_id>.steps.env` but NOT under
-          # `jobs.<job_id>.env` — a job-level block renders them empty, and the
-          # failure is silent (an unstamped page looks exactly like an older
-          # publisher). Env-indirection for the same reason as $REPO above: these
-          # are interpolated values on a runner that later holds SOURCE_TOKEN and
-          # the Cloudflare token, so they stay data and never become script text.
-          #
-          # WORKFLOW_REF is what the tenant ASKED for
-          # (…/deploy-pages.yml@refs/tags/v1); WORKFLOW_SHA is what they GOT. Both
-          # are needed: the ref alone is the moving pointer this fixes, and the sha
-          # alone cannot tell `@v1` from a SHA-pinned tenant.
-          #
-          # It must be `job.`, never `github.`. In a reusable workflow the `github`
-          # context belongs to the CALLER, so `github.workflow_ref` names the
-          # tenant's own deploy.yml — the one thing we already know — while
-          # `job.workflow_ref` is documented as "For jobs defined in a reusable
-          # workflow, this refers to the reusable workflow file".
-          #
-          # actionlint (through 1.7.12, and on its main branch) rejects both lines:
-          # its `job` context type declares only check_run_id/container/services/
-          # status and has never been updated for workflow_ref/workflow_sha/
-          # workflow_repository. That is a stale type model, not a real error — the
-          # three are documented in GitHub's contexts reference — and nothing in
-          # this repo's CI runs actionlint. Do not "fix" it by reaching for
-          # `github.`; that silently stamps the wrong repository.
-          WORKFLOW_REF: ${{ job.workflow_ref }}
-          WORKFLOW_SHA: ${{ job.workflow_sha }}
-        run: |
-          set -uo pipefail
-          # `job.workflow_sha` is documented as unavailable on GitHub Enterprise
-          # Server. Both halves are required or the stamp is omitted: a half-value
-          # like `refs/tags/v1@` is non-empty, would be injected, and would claim a
-          # release identity it does not have.
-          release=""
-          if [ -n "${WORKFLOW_REF:-}" ] && [ -n "${WORKFLOW_SHA:-}" ]; then
-            release="${WORKFLOW_REF##*@}@$WORKFLOW_SHA"
-          fi
-          # Echoed because the first release is what PROVES the contexts resolve —
-          # this is the only place the raw values are visible, and an unstamped
-          # page is otherwise indistinguishable from a tenant on an older tag.
-          echo "publisher release: workflow_ref=${WORKFLOW_REF:-<empty>} workflow_sha=${WORKFLOW_SHA:-<empty>}"
-          echo "publisher release: glassdocs-release=${release:-<omitted — pages carry no release stamp>}"
-          node _playbook/templates/search/scripts/inject-source-meta.mjs \
-            --repo "$REPO" \
-            --release "$release" \
-            --site "$SITE_DIR" --docs-dir "$DOCS_DIR"
-
-      # _headers (security headers + CSP) is a Cloudflare Pages control file and
-      # must sit at the site root. It ALWAYS comes from the platform template —
-      # security posture is not a per-KB choice.
-      - name: Add security headers
-        run: cp _playbook/templates/_headers "$SITE_DIR/_headers"
-
-      # The in-page read-aloud control (#187): a ▶ rendered INSIDE the published
-      # page, driving the reader's own speechSynthesis. It exists because the
-      # extension's read-aloud reaches only desktop Chrome — there is no Chrome
-      # extension on iOS and no MV3 side panel on Android Chrome — so before this,
-      # no phone could hear a KB page at all. Nothing is generated, fetched or
-      # stored: the audio is produced by the reader's browser and OS, and the
-      # script issues no network request of any kind.
-      #
-      # UNCONDITIONAL, and deliberately NOT gated on vars.AUDIO_ENABLED. That
-      # variable switches off the generation-and-storage pipeline below (Kokoro,
-      # Release assets, R2), which this route does not use — there is nothing for
-      # it to switch off here. Making the cp conditional would also make an absent
-      # platform asset a LEGITIMATE tenant state, and it never is: unlike the
-      # audio Release lookup, a missing file here is always a broken release, so
-      # `cp` failing the deploy is the correct and intended behaviour.
-      #
-      # A tenant who objects on brand grounds hides it with one rule on
-      # `#glassdocs-read-aloud` in their own extra_css — no platform surface, no
-      # per-repo configuration, which is the whole point of this route.
-      - name: Add the in-page read-aloud control
-        run: |
-          set -euo pipefail
-          mkdir -p "$SITE_DIR/assets"
-          cp _playbook/templates/read-aloud/read-aloud.js "$SITE_DIR/assets/glassdocs-read-aloud.js"
-
       # Pull this KB's generated page audio out of its GitHub Release and into
       # the site, so it ships as part of THIS deployment (#94).
       #
-      # WHY SAME-ORIGIN, and why it is not negotiable: `_headers` (copied one step
-      # above, from the platform template, because "security posture is not a
-      # per-KB choice") sets `default-src 'self'` and declares NO `media-src` — so
-      # media inherits `'self'` and only the KB's own origin can be played. That
-      # is also the only place inside the KB's Cloudflare Access app: audio served
-      # from a bucket or a second origin would be the spoken content of a gated
-      # page, reachable without the gate. Serving it from $SITE_DIR is what makes
-      # a private KB's audio as private as the page it was spoken from.
+      # THIS STEP RUNS BEFORE THE INJECTOR, and the order is load-bearing (#97).
+      # It used to sit below "Add the in-page read-aloud control", which meant the
+      # injector could not know what audio had shipped and so could not stamp
+      # `audio-file` / `audio-sha` into the pages that have a clip — leaving a
+      # tenant's paid-for narration on the site with no way for a reader to play
+      # it. It has no dependency on the injector, on _headers or on the read-aloud
+      # cp: it reads a GitHub release and writes into $SITE_DIR/audio/. The
+      # alternative — leaving the order alone and running the injector twice —
+      # would work (injectInto is a proven fixed point) but doubles the HTML pass
+      # over every page and recomputes every source path and blob sha for nothing.
+      #
+      # WHY SAME-ORIGIN, and why it is not negotiable: `_headers` (copied from the
+      # platform template a few steps BELOW this one, because "security posture is
+      # not a per-KB choice") sets `default-src 'self'` and declares NO
+      # `media-src` — so media inherits `'self'` and only the KB's own origin can
+      # be played. That is also the only place inside the KB's Cloudflare Access
+      # app: audio served from a bucket or a second origin would be the spoken
+      # content of a gated page, reachable without the gate. Serving it from
+      # $SITE_DIR is what makes a private KB's audio as private as the page it was
+      # spoken from. The argument is about what the DEPLOYED site serves, so it is
+      # unaffected by which step copies _headers first.
       #
       # Both tiers, one code path: client-hosted checks out with github.token
       # under `permissions: contents: read` (declared at the top of this job) and
@@ -756,6 +669,138 @@ jobs:
           cp -R "${STAGE}/." "${SITE_DIR}/audio/"
           rm -rf "$STAGE" "$META"
           echo "Published audio for ${COUNT} page(s) into ${SITE_DIR}/audio/ (same-origin, inside this KB's Access app)."
+
+      # Inject GlassDocs recognition meta (source-repo / source-path) into the
+      # built HTML so the browser extension recognises this site and maps each
+      # page to its Markdown source. Post-build + build-agnostic on purpose:
+      # Zensical rewrote theming, so mkdocs-material template overrides are a
+      # no-op — the repo identity is a deploy-time fact, injected here where CI
+      # actually knows it. Non-fatal if the repo can't be determined.
+      - name: Inject GlassDocs recognition meta
+        env:
+          # Env-indirection, NOT `${{ }}` inlined into the script line: source-repo
+          # is an unvalidated workflow_call input, and bash re-evaluates inlined
+          # interpolation, so inlining it would allow shell injection on the runner
+          # that later holds SOURCE_TOKEN + the Cloudflare token. Passed as $REPO,
+          # the value is data, never code. (The injector also validates the format
+          # and bails safely if it isn't OWNER/NAME.)
+          REPO: ${{ inputs.source-repo != '' && inputs.source-repo || github.repository }}
+          # #210 — the publisher release that built this page. `@v1` is a moving
+          # pointer: it moved three times in 26 hours and the released artefact
+          # recorded nothing, so "which publisher release built this KB?" could
+          # only be answered from a tenant's checkout log, which expires and which
+          # no reader of a published page can reach.
+          #
+          # These MUST be step-level. The contexts reference's availability table
+          # lists `job` under `jobs.<job_id>.steps.env` but NOT under
+          # `jobs.<job_id>.env` — a job-level block renders them empty, and the
+          # failure is silent (an unstamped page looks exactly like an older
+          # publisher). Env-indirection for the same reason as $REPO above: these
+          # are interpolated values on a runner that later holds SOURCE_TOKEN and
+          # the Cloudflare token, so they stay data and never become script text.
+          #
+          # WORKFLOW_REF is what the tenant ASKED for
+          # (…/deploy-pages.yml@refs/tags/v1); WORKFLOW_SHA is what they GOT. Both
+          # are needed: the ref alone is the moving pointer this fixes, and the sha
+          # alone cannot tell `@v1` from a SHA-pinned tenant.
+          #
+          # It must be `job.`, never `github.`. In a reusable workflow the `github`
+          # context belongs to the CALLER, so `github.workflow_ref` names the
+          # tenant's own deploy.yml — the one thing we already know — while
+          # `job.workflow_ref` is documented as "For jobs defined in a reusable
+          # workflow, this refers to the reusable workflow file".
+          #
+          # actionlint (through 1.7.12, and on its main branch) rejects both lines:
+          # its `job` context type declares only check_run_id/container/services/
+          # status and has never been updated for workflow_ref/workflow_sha/
+          # workflow_repository. That is a stale type model, not a real error — the
+          # three are documented in GitHub's contexts reference — and nothing in
+          # this repo's CI runs actionlint. Do not "fix" it by reaching for
+          # `github.`; that silently stamps the wrong repository.
+          WORKFLOW_REF: ${{ job.workflow_ref }}
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: |
+          set -uo pipefail
+          # `job.workflow_sha` is documented as unavailable on GitHub Enterprise
+          # Server. Both halves are required or the stamp is omitted: a half-value
+          # like `refs/tags/v1@` is non-empty, would be injected, and would claim a
+          # release identity it does not have.
+          release=""
+          if [ -n "${WORKFLOW_REF:-}" ] && [ -n "${WORKFLOW_SHA:-}" ]; then
+            release="${WORKFLOW_REF##*@}@$WORKFLOW_SHA"
+          fi
+          # Echoed because the first release is what PROVES the contexts resolve —
+          # this is the only place the raw values are visible, and an unstamped
+          # page is otherwise indistinguishable from a tenant on an older tag.
+          echo "publisher release: workflow_ref=${WORKFLOW_REF:-<empty>} workflow_sha=${WORKFLOW_SHA:-<empty>}"
+          echo "publisher release: glassdocs-release=${release:-<omitted — pages carry no release stamp>}"
+          # --audio-manifest (#97): the manifest the audio step above just wrote,
+          # naming every page this deployment serves a clip for. Passed
+          # UNCONDITIONALLY and by path, exactly like --release: a KB with no
+          # audio (AUDIO_ENABLED unset, or nothing generated yet) has no such
+          # file, the injector treats that as "no audio anywhere", emits no audio
+          # meta, and the deploy is byte-for-byte what it was before. The feature
+          # is inert, not off.
+          node _playbook/templates/search/scripts/inject-source-meta.mjs \
+            --repo "$REPO" \
+            --release "$release" \
+            --audio-manifest "$SITE_DIR/audio/manifest.json" \
+            --site "$SITE_DIR" --docs-dir "$DOCS_DIR"
+
+      # _headers (security headers + CSP) is a Cloudflare Pages control file and
+      # must sit at the site root. It ALWAYS comes from the platform template —
+      # security posture is not a per-KB choice.
+      - name: Add security headers
+        run: cp _playbook/templates/_headers "$SITE_DIR/_headers"
+
+      # The in-page read-aloud control (#187): a ▶ rendered INSIDE the published
+      # page, driving the reader's own speech engine. It exists because the
+      # extension's read-aloud reaches only desktop Chrome — there is no Chrome
+      # extension on iOS and no MV3 side panel on Android Chrome — so before this,
+      # no phone could hear a KB page at all.
+      #
+      # WHAT IT SENDS, exactly (#97 amended this — the previous wording said "no
+      # network request of any kind" and is no longer true):
+      #
+      #   on page load          nothing, on every page, whatever it carries. No
+      #                         fetch, no beacon, no analytics, no control-plane
+      #                         call — asserted by route interception in
+      #                         extension/e2e/read-aloud-page.spec.mjs.
+      #   ▶ Listen              nothing. The audio is produced by the reader's own
+      #                         browser and OS, with a voice whose localService is
+      #                         true, and it refuses to speak rather than fall back
+      #                         to a remote synthesiser.
+      #   ▶ AI (only if this
+      #   page has a current
+      #   clip in this deploy)  exactly one request, made only by that press: a GET
+      #                         for /audio/<the clip this page named>, on the KB's
+      #                         OWN origin, inside this KB's own Access app. The
+      #                         <audio> element carries preload="none", so nothing
+      #                         is fetched until the press.
+      #
+      # Nothing about which page a reader is on ever leaves the device: whether a
+      # clip exists is answered by two <meta> tags in the page the reader already
+      # loaded, never by asking us.
+      #
+      # UNCONDITIONAL, and deliberately NOT gated on vars.AUDIO_ENABLED. That
+      # variable switches off the generation-and-storage pipeline above (Kokoro,
+      # Release assets, R2), which the browser-TTS route does not use — and the
+      # AI control gates itself, on the presence of those metas, which the
+      # injector emits only for a KB that published a clip. So a KB with audio off
+      # gets the browser-TTS floor and nothing else, with no per-KB configuration.
+      # Making the cp conditional would also make an absent platform asset a
+      # LEGITIMATE tenant state, and it never is: unlike the audio Release lookup,
+      # a missing file here is always a broken release, so `cp` failing the deploy
+      # is the correct and intended behaviour.
+      #
+      # A tenant who objects on brand grounds hides it with one rule on
+      # `#glassdocs-read-aloud` in their own extra_css — no platform surface, no
+      # per-repo configuration, which is the whole point of this route.
+      - name: Add the in-page read-aloud control
+        run: |
+          set -euo pipefail
+          mkdir -p "$SITE_DIR/assets"
+          cp _playbook/templates/read-aloud/read-aloud.js "$SITE_DIR/assets/glassdocs-read-aloud.js"
 
       # ── 0. Cloudflare credential preflight ──
       # Report exactly what arrived so an empty/short secret is diagnosable at a

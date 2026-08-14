@@ -13,6 +13,28 @@
 // without a clean source (e.g. 404.html) still gets source-repo and is
 // recognised. source-sha is emitted only when the Markdown source is on disk.
 //
+// Two more name the CLIP this deployment serves for this page (#97), when there
+// is one:
+//   <meta name="audio-file" content="/audio/gd-audio-<20 hex>.opus">
+//   <meta name="audio-sha"  content="<the page version it was spoken FROM>">
+//
+// They exist so a reader can answer "does this page have playable audio?" with
+// NO network request. The alternative — fetching /audio/manifest.json at runtime
+// — would fire on every page load of every KB and delete the zero-network
+// property the in-page control publishes and its e2e suite asserts by route
+// interception; it would also drag Cloudflare Access and Pages' branded HTML 404
+// back into a one-page question. The manifest keeps being published: it is the
+// deployment's own record, and it is what THIS script reads at build time. It is
+// simply not on a reader's path.
+//
+// This script does NOT compare the two shas, and that is deliberate. It emits
+// both facts and the reader decides: a build-side verdict would collapse "stale"
+// into "absent" and take away the page's ability to tell them apart. Staleness
+// is a MISMATCH and never an absence — deploy-pages.yml rebuilds the manifest
+// from whatever sidecars are on the release and compares source_sha to nothing,
+// so an edited page keeps its clip, keeps its manifest entry, and ships a stale
+// audio-sha against a moved source-sha.
+//
 // The block also names the PUBLISHER RELEASE that built the page (#210):
 //   <meta name="glassdocs-release" content="refs/tags/v1@<sha>">
 // `Glassdocs/publisher@v1` is a moving pointer, not a version — it moved three
@@ -49,6 +71,7 @@
 //
 // Usage: node inject-source-meta.mjs --repo OWNER/NAME --site DIR [--docs-dir docs]
 //                                    [--release refs/tags/v1@<sha>]
+//                                    [--audio-manifest DIR/audio/manifest.json]
 //
 // Bails (warning, exit 0) if --repo is missing/invalid so a deploy never fails
 // on this — the site still ships, the extension's write features just stay off.
@@ -67,15 +90,113 @@ const END = "<!-- /@glassdocs-meta -->";
 // is the normal case, so "unstamped emits no tag" has to be checked from the
 // argument vector the workflow really produces.
 export function parseArgs(argv) {
-  const o = { repo: null, site: "site", docsDir: "docs", release: null };
+  const o = { repo: null, site: "site", docsDir: "docs", release: null, audioManifest: null };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--repo") o.repo = argv[++i];
     else if (a === "--site") o.site = argv[++i];
     else if (a === "--docs-dir") o.docsDir = argv[++i];
     else if (a === "--release") o.release = argv[++i];
+    else if (a === "--audio-manifest") o.audioManifest = argv[++i];
   }
   return o;
+}
+
+// ── the audio manifest (#97) ─────────────────────────────────────────
+//
+// These two patterns are the SAME rule the reader applies, in a second language
+// across a bundle boundary: extension/src/lib/published-audio.ts exports
+// AUDIO_FILE_RE and SHA_RE for the page-side half. There is no import that could
+// join them — this file is plain ESM run by the runner, that one is TypeScript
+// bundled into a tenant's site — so what keeps them in step is
+// extension/tests/inject-source-meta.test.mjs, which feeds THIS function's real
+// output to THAT module's reader and asserts the round trip.
+//
+// `file` is constrained to a site-root-relative path under /audio/ carrying this
+// publisher's own gd-audio-<20 hex of SHA-1(sourcePath)> name (server/src/
+// kb-audio.ts, and the same regex the workflow filters release assets on). A
+// malformed or hostile manifest therefore cannot aim a reader's playback at
+// another origin. The page CSP would refuse it too — templates/_headers sets
+// `default-src 'self'` with no `media-src` — but the check belongs where the
+// value is parsed, not only where it is used.
+const AUDIO_FILE_RE = /^\/audio\/gd-audio-[0-9a-f]{20}\.[A-Za-z0-9]+$/;
+const SHA_RE = /^[0-9a-f]{40}$/;
+
+/**
+ * Read $SITE_DIR/audio/manifest.json into a Map keyed by REPO SOURCE PATH.
+ *
+ * The key is the join: the manifest is built with `key: .path` from each clip's
+ * sidecar (deploy-pages.yml), which is the Markdown path in the KB's repo —
+ * never a URL and never a slug. sourcePathFor() below produces the same string
+ * for the built page, so the two meet without either side learning the other's
+ * addressing.
+ *
+ * FAIL-CLOSED AND NON-FATAL, in that order. No flag, no file, unreadable,
+ * unparseable, `version !== 1`, or a `pages` that is not an object → an empty
+ * Map, which means no audio metas on any page and a deploy that carries on
+ * exactly as before. Audio is a derived artefact; blocking a documentation
+ * deploy over it would be the worse failure, and that is the same rule the
+ * workflow's own audio step applies throughout.
+ *
+ * An ABSENT file is silent — that is every KB that has never generated a clip,
+ * and the overwhelmingly common case. A file that is present but unusable warns,
+ * because that one is a broken deployment rather than a normal state, and
+ * "audio on 0" with no explanation is exactly the silent failure this repo keeps
+ * paying for.
+ */
+export function loadAudioManifest(file, read = readFileSync) {
+  const out = new Map();
+  if (!file) return out;
+  let raw;
+  try {
+    raw = read(file, "utf8");
+  } catch {
+    // No manifest: this KB published no audio this deploy. Not a problem.
+    return out;
+  }
+  let doc;
+  try {
+    doc = JSON.parse(raw);
+  } catch (e) {
+    console.warn(`inject-source-meta: ${file} is not valid JSON (${e.message}) — no audio meta will be emitted.`);
+    return out;
+  }
+  if (!doc || typeof doc !== "object" || doc.version !== 1) {
+    console.warn(
+      `inject-source-meta: ${file} has version ${JSON.stringify(doc?.version)}, not 1 — no audio meta will be emitted. ` +
+        "A newer manifest than this publisher understands is refused rather than guessed at.",
+    );
+    return out;
+  }
+  if (!doc.pages || typeof doc.pages !== "object") {
+    console.warn(`inject-source-meta: ${file} has no usable "pages" object — no audio meta will be emitted.`);
+    return out;
+  }
+  let rejected = 0;
+  for (const [sourcePath, entry] of Object.entries(doc.pages)) {
+    if (!entry || typeof entry !== "object") {
+      rejected++;
+      continue;
+    }
+    // Both or neither. A page whose entry fails either check emits NO audio meta
+    // at all, rather than half a pair the reader would have to interpret.
+    if (typeof entry.file !== "string" || !AUDIO_FILE_RE.test(entry.file)) {
+      rejected++;
+      continue;
+    }
+    if (typeof entry.source_sha !== "string" || !SHA_RE.test(entry.source_sha)) {
+      rejected++;
+      continue;
+    }
+    out.set(sourcePath, { file: entry.file, sourceSha: entry.source_sha });
+  }
+  if (rejected) {
+    console.warn(
+      `inject-source-meta: ${rejected} entr${rejected === 1 ? "y" : "ies"} in ${file} failed validation ` +
+        "and will ship without audio meta.",
+    );
+  }
+  return out;
 }
 
 function escapeAttr(s) {
@@ -176,7 +297,17 @@ const READ_ALOUD_SRC = "/assets/glassdocs-read-aloud.js";
 // stamp nobody can trust is worse than no stamp. `job.workflow_sha` is documented
 // as unavailable on GitHub Enterprise Server; on such a runner the value arrives
 // empty, the tag is omitted, and the deploy is otherwise unaffected.
-export function injectInto(html, repo, sourcePath, sourceSha, release) {
+//
+// `audioFile` / `audioSha` (#97) are OPTIONAL and come as a PAIR — both or
+// neither, on the same fail-open rule. They are emitted verbatim, because
+// validation already happened where the value was PARSED
+// (loadAudioManifest above), and they are never compared to `sourceSha` here:
+// the reader owns that comparison, and a build-side verdict would collapse
+// "stale" into "absent". Half a pair would be a fact no reader could use — an
+// audio-sha with no file names nothing, and a file with no version is a clip
+// nothing can vouch for, which is exactly the fail-open #94 wrote the rule
+// against.
+export function injectInto(html, repo, sourcePath, sourceSha, release, audioFile, audioSha) {
   // Strip exactly what this function inserted, and nothing else: the block's own
   // indent (`[ \t]*`, horizontal only) and its own closing newline (`\n?`, see
   // `block` below). That precision is the whole fixed-point property.
@@ -211,6 +342,8 @@ export function injectInto(html, repo, sourcePath, sourceSha, release) {
     `  <meta name="source-repo" content="${escapeAttr(repo)}">\n` +
     (sourcePath ? `  <meta name="source-path" content="${escapeAttr(sourcePath)}">\n` : "") +
     (sourcePath && sourceSha ? `  <meta name="source-sha" content="${escapeAttr(sourceSha)}">\n` : "") +
+    (audioFile && audioSha ? `  <meta name="audio-file" content="${escapeAttr(audioFile)}">\n` : "") +
+    (audioFile && audioSha ? `  <meta name="audio-sha" content="${escapeAttr(audioSha)}">\n` : "") +
     (release ? `  <meta name="glassdocs-release" content="${escapeAttr(release)}">\n` : "") +
     `  <script defer src="${READ_ALOUD_SRC}"></script>\n` +
     `  ${END}\n`;
@@ -226,8 +359,12 @@ function main() {
     return;
   }
   const files = htmlFiles(args.site);
+  // Loaded ONCE, before the walk: a per-page read of the same file would be N
+  // syscalls and N chances to warn about the same broken manifest.
+  const audio = loadAudioManifest(args.audioManifest);
   let injected = 0;
   let versioned = 0;
+  let audible = 0;
   // The build ran in the checked-out repo, so each page's Markdown is on disk
   // and can be hashed once. Cache by source path: section landings map several
   // built pages to one source on some layouts.
@@ -239,15 +376,33 @@ function main() {
       if (!shaCache.has(sourcePath)) shaCache.set(sourcePath, sourceShaFor(sourcePath));
       sha = shaCache.get(sourcePath);
     }
-    const out = injectInto(readFileSync(f, "utf8"), args.repo, sourcePath, sha, args.release);
+    // Keyed on the SAME string sourcePathFor() just produced — the manifest's
+    // own key is the repo source path. A page with no clean source (404.html)
+    // has nothing to look up, which is correct: it also has no source-sha, so a
+    // clip could never be checked against it anyway.
+    const clip = sourcePath ? audio.get(sourcePath) : undefined;
+    const out = injectInto(
+      readFileSync(f, "utf8"),
+      args.repo,
+      sourcePath,
+      sha,
+      args.release,
+      clip?.file ?? null,
+      clip?.sourceSha ?? null,
+    );
     if (out == null) continue; // no <head>
     writeFileSync(f, out);
     injected++;
     if (sha) versioned++;
+    if (clip) audible++;
   }
   console.log(
     `inject-source-meta: source-repo=${args.repo} into ${injected}/${files.length} page(s); ` +
       `source-sha on ${versioned}; ` +
+      // Legible BESIDE source-sha on purpose: audio is only playable on a page
+      // that also carries a version, so "audio on 3" against "source-sha on 19"
+      // is the sentence a tenant needs to read the feature's reach off a deploy.
+      `audio on ${audible}; ` +
       `glassdocs-release=${args.release || "(none — pages will carry no release stamp)"}.`,
   );
 }

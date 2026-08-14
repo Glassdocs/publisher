@@ -13,6 +13,20 @@
 // without a clean source (e.g. 404.html) still gets source-repo and is
 // recognised. source-sha is emitted only when the Markdown source is on disk.
 //
+// The block also names the PUBLISHER RELEASE that built the page (#210):
+//   <meta name="glassdocs-release" content="refs/tags/v1@<sha>">
+// `Glassdocs/publisher@v1` is a moving pointer, not a version — it moved three
+// times in 26 hours and nothing in the released artefact recorded which of those
+// workflows a given KB got. Answering "which publisher release built this?" meant
+// finding the tenant's Actions run and reading `HEAD is now at …` out of a
+// checkout log, which expires with the log and which no reader of a published
+// page can do at all. The ref alone is the moving pointer this fixes; the SHA
+// alone cannot tell `@v1` from a SHA-pinned tenant, so the deploy workflow ships
+// BOTH, joined, out of `job.workflow_ref` / `job.workflow_sha` (the ref the
+// tenant asked for, and the commit they got). It is passed in rather than derived
+// because the publisher's version is not in the tenant's repo — nothing on disk
+// here knows it.
+//
 // The same block also carries the ONE platform script a built KB gets:
 //   <script defer src="/assets/glassdocs-read-aloud.js"></script>  — the in-page
 // read-aloud control (#187), which is what lets a phone hear a KB page at all.
@@ -34,6 +48,7 @@
 // precisely that rather than assuming the two agree).
 //
 // Usage: node inject-source-meta.mjs --repo OWNER/NAME --site DIR [--docs-dir docs]
+//                                    [--release refs/tags/v1@<sha>]
 //
 // Bails (warning, exit 0) if --repo is missing/invalid so a deploy never fails
 // on this — the site still ships, the extension's write features just stay off.
@@ -46,13 +61,19 @@ import path from "node:path";
 const START = "<!-- @glassdocs-meta -->";
 const END = "<!-- /@glassdocs-meta -->";
 
-function parseArgs(argv) {
-  const o = { repo: null, site: "site", docsDir: "docs" };
+// Exported so the suite can assert what an omitted `--release` actually yields.
+// Asserting `injectInto(…, null)` alone would only prove the branch, not that the
+// CLI reaches it: the release is optional and a deploy that never passes the flag
+// is the normal case, so "unstamped emits no tag" has to be checked from the
+// argument vector the workflow really produces.
+export function parseArgs(argv) {
+  const o = { repo: null, site: "site", docsDir: "docs", release: null };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--repo") o.repo = argv[++i];
     else if (a === "--site") o.site = argv[++i];
     else if (a === "--docs-dir") o.docsDir = argv[++i];
+    else if (a === "--release") o.release = argv[++i];
   }
   return o;
 }
@@ -146,7 +167,16 @@ const READ_ALOUD_SRC = "/assets/glassdocs-read-aloud.js";
 
 // Insert (or replace) the meta block just before </head>. Returns the new HTML,
 // or null when there is no <head> to inject into.
-export function injectInto(html, repo, sourcePath, sourceSha) {
+//
+// `release` is the publisher release identity (#210) and is OPTIONAL: null,
+// undefined and "" all omit the tag entirely rather than emitting an empty
+// attribute. Same fail-open rule as source-path and source-sha above, for the
+// same reason — `content=""` would read as "this KB records no release", which is
+// indistinguishable from a release string the workflow failed to resolve, and a
+// stamp nobody can trust is worse than no stamp. `job.workflow_sha` is documented
+// as unavailable on GitHub Enterprise Server; on such a runner the value arrives
+// empty, the tag is omitted, and the deploy is otherwise unaffected.
+export function injectInto(html, repo, sourcePath, sourceSha, release) {
   // Strip exactly what this function inserted, and nothing else: the block's own
   // indent (`[ \t]*`, horizontal only) and its own closing newline (`\n?`, see
   // `block` below). That precision is the whole fixed-point property.
@@ -181,6 +211,7 @@ export function injectInto(html, repo, sourcePath, sourceSha) {
     `  <meta name="source-repo" content="${escapeAttr(repo)}">\n` +
     (sourcePath ? `  <meta name="source-path" content="${escapeAttr(sourcePath)}">\n` : "") +
     (sourcePath && sourceSha ? `  <meta name="source-sha" content="${escapeAttr(sourceSha)}">\n` : "") +
+    (release ? `  <meta name="glassdocs-release" content="${escapeAttr(release)}">\n` : "") +
     `  <script defer src="${READ_ALOUD_SRC}"></script>\n` +
     `  ${END}\n`;
   return stripped.slice(0, headClose) + block + stripped.slice(headClose);
@@ -208,7 +239,7 @@ function main() {
       if (!shaCache.has(sourcePath)) shaCache.set(sourcePath, sourceShaFor(sourcePath));
       sha = shaCache.get(sourcePath);
     }
-    const out = injectInto(readFileSync(f, "utf8"), args.repo, sourcePath, sha);
+    const out = injectInto(readFileSync(f, "utf8"), args.repo, sourcePath, sha, args.release);
     if (out == null) continue; // no <head>
     writeFileSync(f, out);
     injected++;
@@ -216,7 +247,8 @@ function main() {
   }
   console.log(
     `inject-source-meta: source-repo=${args.repo} into ${injected}/${files.length} page(s); ` +
-      `source-sha on ${versioned}.`,
+      `source-sha on ${versioned}; ` +
+      `glassdocs-release=${args.release || "(none — pages will carry no release stamp)"}.`,
   );
 }
 

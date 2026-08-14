@@ -400,9 +400,58 @@ jobs:
           # the value is data, never code. (The injector also validates the format
           # and bails safely if it isn't OWNER/NAME.)
           REPO: ${{ inputs.source-repo != '' && inputs.source-repo || github.repository }}
+          # #210 — the publisher release that built this page. `@v1` is a moving
+          # pointer: it moved three times in 26 hours and the released artefact
+          # recorded nothing, so "which publisher release built this KB?" could
+          # only be answered from a tenant's checkout log, which expires and which
+          # no reader of a published page can reach.
+          #
+          # These MUST be step-level. The contexts reference's availability table
+          # lists `job` under `jobs.<job_id>.steps.env` but NOT under
+          # `jobs.<job_id>.env` — a job-level block renders them empty, and the
+          # failure is silent (an unstamped page looks exactly like an older
+          # publisher). Env-indirection for the same reason as $REPO above: these
+          # are interpolated values on a runner that later holds SOURCE_TOKEN and
+          # the Cloudflare token, so they stay data and never become script text.
+          #
+          # WORKFLOW_REF is what the tenant ASKED for
+          # (…/deploy-pages.yml@refs/tags/v1); WORKFLOW_SHA is what they GOT. Both
+          # are needed: the ref alone is the moving pointer this fixes, and the sha
+          # alone cannot tell `@v1` from a SHA-pinned tenant.
+          #
+          # It must be `job.`, never `github.`. In a reusable workflow the `github`
+          # context belongs to the CALLER, so `github.workflow_ref` names the
+          # tenant's own deploy.yml — the one thing we already know — while
+          # `job.workflow_ref` is documented as "For jobs defined in a reusable
+          # workflow, this refers to the reusable workflow file".
+          #
+          # actionlint (through 1.7.12, and on its main branch) rejects both lines:
+          # its `job` context type declares only check_run_id/container/services/
+          # status and has never been updated for workflow_ref/workflow_sha/
+          # workflow_repository. That is a stale type model, not a real error — the
+          # three are documented in GitHub's contexts reference — and nothing in
+          # this repo's CI runs actionlint. Do not "fix" it by reaching for
+          # `github.`; that silently stamps the wrong repository.
+          WORKFLOW_REF: ${{ job.workflow_ref }}
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
         run: |
+          set -uo pipefail
+          # `job.workflow_sha` is documented as unavailable on GitHub Enterprise
+          # Server. Both halves are required or the stamp is omitted: a half-value
+          # like `refs/tags/v1@` is non-empty, would be injected, and would claim a
+          # release identity it does not have.
+          release=""
+          if [ -n "${WORKFLOW_REF:-}" ] && [ -n "${WORKFLOW_SHA:-}" ]; then
+            release="${WORKFLOW_REF##*@}@$WORKFLOW_SHA"
+          fi
+          # Echoed because the first release is what PROVES the contexts resolve —
+          # this is the only place the raw values are visible, and an unstamped
+          # page is otherwise indistinguishable from a tenant on an older tag.
+          echo "publisher release: workflow_ref=${WORKFLOW_REF:-<empty>} workflow_sha=${WORKFLOW_SHA:-<empty>}"
+          echo "publisher release: glassdocs-release=${release:-<omitted — pages carry no release stamp>}"
           node _playbook/templates/search/scripts/inject-source-meta.mjs \
             --repo "$REPO" \
+            --release "$release" \
             --site "$SITE_DIR" --docs-dir "$DOCS_DIR"
 
       # _headers (security headers + CSP) is a Cloudflare Pages control file and

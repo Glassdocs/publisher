@@ -8,10 +8,26 @@ description: |
                  + optional explicit client emails
   With no includes the allow policy matches nobody (fail-closed).
 
+  Managed policies only. A policy is replaced ONLY if its name matches, by exact
+  string equality, one this project's tooling has created:
+    "Allow staff + clients", "Office network bypass",
+    "Allow Rocket Lab + clients", "Allow Rocket Lab emails"
+  Anything else on the app was added by the tenant — typically a hand-created
+  grant for a client, and often their only way into their own documentation. It
+  is PRESERVED and reported as a ::notice:: (a ::warning:: when the KB is being
+  deployed locked, since a surviving grant means it is not in fact locked). This
+  action will not remove it; remove it in the Cloudflare dashboard if unwanted.
+
   Lockout-safe ordering: inputs are validated before any mutation, the new
   policies are created first, and only after every create succeeds are the
-  pre-existing policies deleted — so the live state matches the inputs and a
-  working KB is never left with zero policies.
+  pre-existing managed policies deleted — so the live state matches the inputs
+  and a working KB is never left with zero policies.
+
+  Verified removal: after deleting, the app's policies are read back. A policy
+  this run deleted that is still present fails the step. Revoking a reader is
+  done by dropping them from client-emails and letting the old policy be
+  deleted, so a delete that silently does not take effect leaves the revoked
+  reader with access — and that has happened, reported as success.
 
   Shell logic lives in templates/search/scripts/sync-access-policies.sh so it
   can be unit-tested locally.

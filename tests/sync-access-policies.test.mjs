@@ -13,12 +13,31 @@ import { sandbox, runSync, policyList, policy, POLICIES_PATH, APP_ID } from "./h
 const OLD_A = policy("old-a", "Allow staff + clients", 1);
 const OLD_B = policy("old-b", "Office network bypass", 2);
 
-/** Routes for a healthy API: one page of policies, creates and deletes succeed. */
+// The names the script owns. Anything else on an app belongs to the tenant and
+// must survive a sync — see the ownership block near the bottom of this file.
+const MANAGED_NAMES = new Set([
+  "Allow staff + clients",
+  "Office network bypass",
+  "Allow Rocket Lab + clients",
+  "Allow Rocket Lab emails",
+]);
+
+/**
+ * Routes for a healthy API: one page of policies, creates and deletes succeed.
+ *
+ * The listing is SEQUENCED (`times: 1`), because the script lists twice: once
+ * before mutating, and once after deleting to verify the removal took effect.
+ * Serving the pre-delete list to both would make a correct run look like every
+ * delete had silently failed.
+ */
 function healthyRoutes(existing = [OLD_A, OLD_B]) {
+  const survivors = existing.filter((p) => !MANAGED_NAMES.has(p.name));
   return [
-    { method: "GET", urlIncludes: "/policies?page=1", body: policyList(existing) },
+    { method: "GET", urlIncludes: "/policies?page=1", times: 1, body: policyList(existing) },
     { method: "POST", urlIncludes: "/policies", body: { success: true, errors: [], result: { id: "new-1" } } },
     { method: "DELETE", urlIncludes: "/policies/", body: { success: true, errors: [], result: null } },
+    // The post-delete read-back: what a healthy API is left holding.
+    { method: "GET", urlIncludes: "/policies", body: policyList(survivors) },
   ];
 }
 
@@ -72,7 +91,8 @@ test("create-first: every new policy is POSTed before any old policy is DELETEd"
     lastPost < firstDelete,
     `deletes must come after ALL creates; sequence was ${JSON.stringify(sb.calls())}`,
   );
-  assert.deepEqual(seq, ["GET", "POST", "POST", "DELETE", "DELETE"]);
+  // The trailing GET is the post-delete read-back that verifies the removal.
+  assert.deepEqual(seq, ["GET", "POST", "POST", "DELETE", "DELETE", "GET"]);
 });
 
 test("a failed allow-policy create leaves the existing policies intact and exits non-zero", (t) => {
@@ -356,14 +376,22 @@ test("empty items in CLIENT_EMAILS are skipped rather than failing the deploy", 
 
 // ── Pagination ────────────────────────────────────────────────────────
 
-test("policies beyond page 1 are still deleted", (t) => {
-  const page1 = Array.from({ length: 3 }, (_, i) => policy(`p1-${i}`, `Policy ${i}`, i + 1));
-  const page2 = [policy("p2-a", "Straggler A", 51), policy("p2-b", "Straggler B", 52)];
+test("managed policies beyond page 1 are still deleted", (t) => {
+  // The fixtures carry MANAGED names on purpose: this test is about pagination,
+  // not ownership. Named "Policy 0" / "Straggler A" it asserted only that the
+  // script deletes indiscriminately, which is the defect, not the contract.
+  const page1 = [
+    policy("p1-0", "Allow staff + clients", 1),
+    policy("p1-1", "Allow Rocket Lab + clients", 2),
+    policy("p1-2", "Allow Rocket Lab emails", 3),
+  ];
+  const page2 = [policy("p2-a", "Office network bypass", 51), policy("p2-b", "Allow staff + clients", 52)];
   const sb = sandbox([
-    { method: "GET", urlIncludes: "page=1", body: policyList(page1, { total_pages: 2, page: 1 }) },
-    { method: "GET", urlIncludes: "page=2", body: policyList(page2, { total_pages: 2, page: 2 }) },
+    { method: "GET", urlIncludes: "page=1", times: 1, body: policyList(page1, { total_pages: 2, page: 1 }) },
+    { method: "GET", urlIncludes: "page=2", times: 1, body: policyList(page2, { total_pages: 2, page: 2 }) },
     { method: "POST", urlIncludes: "/policies", body: { success: true, result: { id: "new-1" } } },
     { method: "DELETE", urlIncludes: "/policies/", body: { success: true } },
+    { method: "GET", urlIncludes: "/policies", body: policyList([]) },
   ]);
   t.after(() => sb.cleanup());
 
@@ -377,7 +405,7 @@ test("policies beyond page 1 are still deleted", (t) => {
 
 test("a list API that keeps claiming more pages still terminates", (t) => {
   const sb = sandbox([
-    { method: "GET", urlIncludes: "page=1", body: policyList([OLD_A], { total_pages: 999, page: 1 }) },
+    { method: "GET", urlIncludes: "page=1", times: 1, body: policyList([OLD_A], { total_pages: 999, page: 1 }) },
     { method: "GET", urlIncludes: "page=", body: policyList([], { total_pages: 999 }) },
     { method: "POST", urlIncludes: "/policies", body: { success: true, result: { id: "new-1" } } },
     { method: "DELETE", urlIncludes: "/policies/", body: { success: true } },
@@ -388,6 +416,9 @@ test("a list API that keeps claiming more pages still terminates", (t) => {
   assert.equal(res.timedOut, false, "the pagination walk must terminate on its own");
   assert.equal(res.status, 0, res.out);
 
+  // Two for the pre-delete walk (page 1, then the empty page 2 that stops it),
+  // one for the post-delete read-back. A walk that trusted total_pages would
+  // make 999.
   const gets = sb.requests().filter((r) => r.method === "GET");
   assert.ok(gets.length <= 3, `an empty page must stop the walk; made ${gets.length} list calls`);
   assert.equal(deletes(sb).length, 1);
@@ -485,11 +516,17 @@ test("EMAIL_DOMAIN, CLIENT_DOMAIN and CLIENT_EMAILS compose into a single allow 
   ]);
 });
 
-// ── Delete failures ───────────────────────────────────────────────────
+// ── Delete failures, and the read-back that judges them ───────────────
+//
+// The verdict is what the app CONTAINS afterwards, not what DELETE replied.
+// Both directions matter and they disagree in practice: an undeletable reusable
+// policy replies failure and stays (must fail), while a delete can reply
+// success and not take effect (must also fail — a live app carries two
+// identical managed allow policies created four seconds apart, which is that).
 
-test("a failed DELETE of an old policy warns but does not fail the deploy (the new policies are live)", (t) => {
+test("a DELETE that reports failure but actually removed the policy does NOT fail the deploy", (t) => {
   const sb = sandbox([
-    { method: "GET", urlIncludes: "page=1", body: policyList([OLD_A, OLD_B]) },
+    { method: "GET", urlIncludes: "page=1", times: 1, body: policyList([OLD_A, OLD_B]) },
     { method: "POST", urlIncludes: "/policies", body: { success: true, result: { id: "new-1" } } },
     {
       method: "DELETE",
@@ -497,15 +534,188 @@ test("a failed DELETE of an old policy warns but does not fail the deploy (the n
       body: { success: false, errors: [{ code: 10011, message: "reusable policy" }] },
     },
     { method: "DELETE", urlIncludes: "/policies/", body: { success: true } },
+    { method: "GET", urlIncludes: "/policies", body: policyList([]) },
   ]);
   t.after(() => sb.cleanup());
 
   const res = runSync(sb, { EMAIL_DOMAIN: "example.com" });
 
   assert.equal(res.status, 0, res.out);
+  // The per-delete warning survives as a diagnostic: it names the Cloudflare
+  // error message, which the read-back cannot.
   assert.match(res.out, /::warning::Failed to delete old policy/);
   assert.equal(deletes(sb).length, 2, "one undeletable policy must not stop the rest of the cleanup");
   assert.match(res.out, /Policy sync complete/);
+});
+
+test("a policy that survives its DELETE fails the deploy and is named", (t) => {
+  const sb = sandbox([
+    { method: "GET", urlIncludes: "page=1", times: 1, body: policyList([OLD_A, OLD_B]) },
+    { method: "POST", urlIncludes: "/policies", body: { success: true, result: { id: "new-1" } } },
+    {
+      method: "DELETE",
+      urlIncludes: "/policies/old-a",
+      body: { success: false, errors: [{ code: 10011, message: "reusable policy" }] },
+    },
+    { method: "DELETE", urlIncludes: "/policies/", body: { success: true } },
+    // old-a really is still there. Dropping a reader from client-emails is how
+    // they are revoked; if this policy stays, so does their access.
+    { method: "GET", urlIncludes: "/policies", body: policyList([OLD_A]) },
+  ]);
+  t.after(() => sb.cleanup());
+
+  const res = runSync(sb, { EMAIL_DOMAIN: "example.com" });
+
+  assert.notEqual(res.status, 0, `an unrevoked grant must fail the deploy:\n${res.out}`);
+  assert.match(res.out, /::error::/);
+  assert.match(res.out, /old-a/, "the survivor must be named");
+  assert.equal(deletes(sb).length, 2, "every delete is still attempted before the verdict");
+  assert.doesNotMatch(res.out, /Policy sync complete/);
+});
+
+test("a DELETE that reports SUCCESS and did nothing still fails the deploy", (t) => {
+  const sb = sandbox([
+    { method: "GET", urlIncludes: "page=1", times: 1, body: policyList([OLD_A]) },
+    { method: "POST", urlIncludes: "/policies", body: { success: true, result: { id: "new-1" } } },
+    { method: "DELETE", urlIncludes: "/policies/", body: { success: true, errors: [], result: null } },
+    { method: "GET", urlIncludes: "/policies", body: policyList([OLD_A]) },
+  ]);
+  t.after(() => sb.cleanup());
+
+  const res = runSync(sb, { EMAIL_DOMAIN: "example.com" });
+
+  assert.notEqual(res.status, 0, `a status check alone would have passed this:\n${res.out}`);
+  assert.doesNotMatch(res.out, /::warning::Failed to delete/, "the DELETE reported success");
+  assert.match(res.out, /::error::/);
+  assert.match(res.out, /old-a/);
+});
+
+test("a read-back that cannot be read fails the deploy rather than assuming the delete landed", (t) => {
+  const sb = sandbox([
+    { method: "GET", urlIncludes: "page=1", times: 1, body: policyList([OLD_A]) },
+    { method: "POST", urlIncludes: "/policies", body: { success: true, result: { id: "new-1" } } },
+    { method: "DELETE", urlIncludes: "/policies/", body: { success: true } },
+    { method: "GET", urlIncludes: "/policies", body: CF_ERROR },
+  ]);
+  t.after(() => sb.cleanup());
+
+  const res = runSync(sb, { EMAIL_DOMAIN: "example.com" });
+
+  assert.notEqual(res.status, 0);
+  assert.match(res.out, /unconfirmed/);
+  // No lockout: the creates all happened before any delete, so the KB's current
+  // grants are live and this failure reduces nobody's access.
+  assert.match(res.out, /Access is NOT reduced/);
+});
+
+test("no managed policy on the app means no read-back call at all", (t) => {
+  const sb = sandbox(healthyRoutes([policy("theirs", "Rocket Lab Team", 1)]));
+  t.after(() => sb.cleanup());
+
+  const res = runSync(sb, { EMAIL_DOMAIN: "example.com" });
+  assert.equal(res.status, 0, res.out);
+
+  assert.equal(deletes(sb).length, 0);
+  assert.equal(
+    sb.requests().filter((r) => r.method === "GET").length,
+    1,
+    "an empty delete set must not cost an extra API call",
+  );
+});
+
+// ── Ownership: the delete set is OURS, not "everything on the app" ────
+//
+// Every assertion below is on the DELETE SET — the ids actually sent — with
+// DELETE mocked as SUCCEEDING. "The foreign policy still exists afterwards" is
+// not the same claim: with DELETE mocked as failing, never asking and being
+// refused look identical, and that is how the sync shipped for months deleting
+// a client's only grant to their own documentation.
+
+test("a policy this tooling never created is NEVER in the delete set", (t) => {
+  // Measured on live apps: rocketlab-safesale carries "SafeSale Staff" beside
+  // our managed policy, and it is the only rule admitting anyone outside the
+  // staff email domain.
+  const sb = sandbox(healthyRoutes([OLD_A, policy("theirs", "SafeSale Staff", 2)]));
+  t.after(() => sb.cleanup());
+
+  const res = runSync(sb, { EMAIL_DOMAIN: "example.com" });
+  assert.equal(res.status, 0, res.out);
+
+  assert.deepEqual(
+    deletes(sb).map((r) => r.path.split("/").pop()),
+    ["old-a"],
+    "only the managed policy may be deleted",
+  );
+});
+
+test("the tenant's policies are reported by name as a ::notice::, before any mutation", (t) => {
+  const sb = sandbox(healthyRoutes([OLD_A, policy("theirs", "cashair client access", 2)]));
+  t.after(() => sb.cleanup());
+
+  const res = runSync(sb, { EMAIL_DOMAIN: "example.com" });
+  assert.equal(res.status, 0, res.out);
+
+  assert.match(res.out, /::notice::/);
+  assert.match(res.out, /cashair client access/);
+  assert.ok(
+    res.out.indexOf("::notice::") < res.out.indexOf("Creating allow policy"),
+    `the notice must precede any mutation:\n${res.out}`,
+  );
+});
+
+test("LOCKED with a foreign policy still present says so — and still exits 0", (t) => {
+  const sb = sandbox(healthyRoutes([OLD_A, policy("theirs", "Service tokens", 2)]));
+  t.after(() => sb.cleanup());
+
+  const res = runSync(sb, { EMAIL_DOMAIN: "", CLIENT_EMAILS: "", CLIENT_DOMAIN: "" });
+
+  // Never an error: refusing to delete a foreign policy is the decision, and an
+  // intentional lock must stay shippable. But declaring a KB locked while a
+  // grant survives is a contradiction the tenant has to see.
+  assert.equal(res.status, 0, res.out);
+  assert.match(res.out, /::warning::.*Service tokens/);
+  assert.match(res.out, /NOT fully locked/);
+  assert.deepEqual(deletes(sb).map((r) => r.path.split("/").pop()), ["old-a"]);
+});
+
+test("every managed name, current and historical, is recognised as ours", (t) => {
+  // The names drifted: docs-playbook writes "Allow Rocket Lab + clients" TODAY,
+  // and it is live on an already-registered KB, while this script writes "Allow
+  // staff + clients". A current-name-only filter would orphan the installed
+  // base and stack a second allow policy beside each on every deploy.
+  const fixtures = [...MANAGED_NAMES].map((name, i) => policy(`m${i}`, name, i + 1));
+  const sb = sandbox(healthyRoutes(fixtures));
+  t.after(() => sb.cleanup());
+
+  const res = runSync(sb, { EMAIL_DOMAIN: "example.com" });
+  assert.equal(res.status, 0, res.out);
+
+  assert.deepEqual(
+    deletes(sb).map((r) => r.path.split("/").pop()).sort(),
+    fixtures.map((p) => p.id).sort(),
+  );
+  assert.doesNotMatch(res.out, /::notice::/, "none of these belong to the tenant");
+});
+
+test("matching is exact string equality — no case folding, no trimming, no prefix", (t) => {
+  const sb = sandbox(
+    healthyRoutes([
+      policy("n1", "Allow Rocketlab", 1),
+      policy("n2", "allow staff + clients", 2),
+      policy("n3", " Allow staff + clients ", 3),
+      policy("n4", "Allow staff + clients (old)", 4),
+    ]),
+  );
+  t.after(() => sb.cleanup());
+
+  const res = runSync(sb, { EMAIL_DOMAIN: "example.com" });
+  assert.equal(res.status, 0, res.out);
+
+  // Three of these are live on real apps. A near-miss is exactly what a tenant
+  // might type, so widening the match would delete their policy; the cost of
+  // being strict is one visible duplicate, which the ::notice:: surfaces.
+  assert.deepEqual(deletes(sb).map((r) => r.path.split("/").pop()), []);
+  assert.match(res.out, /::notice::/);
 });
 
 // ── Required configuration ────────────────────────────────────────────

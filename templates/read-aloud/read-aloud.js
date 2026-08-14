@@ -228,6 +228,8 @@
   var NO_LOCAL_VOICE = "No on-device voice is installed, so reading aloud would send this page to a remote speech service";
   var MAX_CHUNK = 200;
   var VOICES_TIMEOUT_MS = 2e3;
+  var PAUSE_POLL_MS = 50;
+  var PAUSE_CONFIRM_MS = 500;
   function getSynth() {
     return globalThis.speechSynthesis ?? null;
   }
@@ -347,12 +349,19 @@
       pause() {
         pauseRequested = true;
         synth.pause();
-        setTimeout(() => {
+        let waited = 0;
+        const check = () => {
           if (!pauseRequested || synth.paused) return;
+          waited += PAUSE_POLL_MS;
+          if (waited < PAUSE_CONFIRM_MS) {
+            setTimeout(check, PAUSE_POLL_MS);
+            return;
+          }
           pausedByCancel = true;
           run++;
           synth.cancel();
-        }, 0);
+        };
+        setTimeout(check, PAUSE_POLL_MS);
       },
       resume() {
         pauseRequested = false;

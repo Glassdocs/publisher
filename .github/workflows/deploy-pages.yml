@@ -650,6 +650,12 @@ jobs:
                      model: .model,
                      bytes: .bytes,
                      duration_seconds: .duration_seconds,
+                     # The section timeline (#300): integers only — a start
+                     # offset in deciseconds and a spoken-character count per
+                     # heading. Absent on every clip generated before #300, and
+                     # `null` here for those; the injector drops anything that is
+                     # not a well-formed map rather than stamping it.
+                     sections: .sections,
                      generated_at: .generated_at
                    }
                  }) | from_entries)

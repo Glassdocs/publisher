@@ -155,6 +155,24 @@
   // src/lib/published-audio.ts
   var AUDIO_FILE_RE = /^\/audio\/gd-audio-[0-9a-f]{20}\.[A-Za-z0-9]+$/;
   var SHA_RE = /^[0-9a-f]{40}$/;
+  var AUDIO_SECTIONS_RE = /^\d+:\d+(,\d+:\d+)*$/;
+  var AUDIO_SECTIONS_MAX = 8192;
+  function parseAudioSections(raw) {
+    if (typeof raw !== "string" || raw.length > AUDIO_SECTIONS_MAX) return null;
+    if (!AUDIO_SECTIONS_RE.test(raw)) return null;
+    const out = [];
+    let previous = -1;
+    for (const pair of raw.split(",")) {
+      const [t, c] = pair.split(":");
+      const deciseconds = Number(t);
+      const chars = Number(c);
+      if (!Number.isSafeInteger(deciseconds) || !Number.isSafeInteger(chars)) return null;
+      if (deciseconds < previous) return null;
+      previous = deciseconds;
+      out.push({ start: deciseconds / 10, chars });
+    }
+    return out;
+  }
   function metaContent(doc, name, pattern) {
     const raw = doc.querySelector(`meta[name="${name}"]`)?.getAttribute("content");
     if (typeof raw !== "string" || !pattern.test(raw)) return null;
@@ -188,20 +206,497 @@
     }
   }
 
+  // src/sidepanel/read-aloud-player.ts
+  var SKIP_SECONDS = 10;
+  var KEY_NUDGE_SECONDS = 1;
+  var KEY_STEP_SECONDS = 5;
+  var CLASS_ROOT = "glassdocs-ra-player";
+  var CLASS_BAR = "glassdocs-ra-bar";
+  var CLASS_FILL = "glassdocs-ra-fill";
+  var CLASS_THUMB = "glassdocs-ra-thumb";
+  var CLASS_POSITION = "glassdocs-ra-position";
+  var CLASS_TRANSPORT = "glassdocs-ra-transport";
+  var CLASS_STOP = "glassdocs-ra-stop";
+  var CLASS_PREV = "glassdocs-ra-prev";
+  var CLASS_NEXT = "glassdocs-ra-next";
+  var CLASS_NOW = "glassdocs-ra-now";
+  var CLASS_COMING = "glassdocs-ra-coming";
+  var CLASS_READ = "glassdocs-ra-read";
+  var CLASS_SECTION_ROW = "glassdocs-ra-section";
+  function groupSections(items) {
+    const out = [];
+    for (let i = 0; i < items.length; i++) {
+      const section = items[i].section;
+      const last = out[out.length - 1];
+      if (last && last.section === section) last.count++;
+      else out.push({ section, from: i, count: 1 });
+    }
+    return out;
+  }
+  function groupIndexOf(groups, index) {
+    for (let g = groups.length - 1; g >= 0; g--) if (index >= groups[g].from) return g;
+    return groups.length ? 0 : -1;
+  }
+  function totalChars(items) {
+    let n = 0;
+    for (const item of items) n += item.text.length;
+    return n;
+  }
+  function charsBefore(items, index) {
+    let n = 0;
+    for (let i = 0; i < index && i < items.length; i++) n += items[i].text.length;
+    return n;
+  }
+  function barFraction(snap) {
+    if (snap.state === "ended") return 1;
+    const p = snap.progress;
+    if (!p) return 0;
+    if (snap.seek === "seconds" || snap.items.length === 0) {
+      if (p.duration == null || p.duration <= 0 || p.seconds == null) return 0;
+      return clamp01(p.seconds / p.duration);
+    }
+    const total = totalChars(snap.items);
+    if (total <= 0) return 0;
+    const done = charsBefore(snap.items, p.index) + (p.charIndex ?? 0);
+    return clamp01(done / total);
+  }
+  function clamp01(n) {
+    if (!Number.isFinite(n)) return 0;
+    return Math.min(1, Math.max(0, n));
+  }
+  function etaSeconds(fraction, elapsedPlayingMs, completedItems) {
+    if (completedItems < 1) return null;
+    if (!(fraction > 0) || fraction >= 1) return null;
+    if (!(elapsedPlayingMs > 0)) return null;
+    return elapsedPlayingMs / 1e3 * ((1 - fraction) / fraction);
+  }
+  function formatEta(seconds) {
+    if (seconds < 45) return "about a minute left (est.)";
+    const mins = Math.round(seconds / 60);
+    if (mins < 60) return `about ${Math.max(1, mins)} min left (est.)`;
+    const hours = Math.floor(mins / 60);
+    const rest = mins % 60;
+    return `about ${hours} h ${rest} min left (est.)`;
+  }
+  function formatClock(seconds) {
+    if (seconds == null || !Number.isFinite(seconds) || seconds < 0) return "\u2013:\u2013";
+    const whole = Math.floor(seconds);
+    const m = Math.floor(whole / 60);
+    const s = whole % 60;
+    return `${m}:${s < 10 ? "0" : ""}${s}`;
+  }
+  function positionLine(snap, elapsedPlayingMs) {
+    const p = snap.progress;
+    if (snap.items.length === 0) {
+      const seconds = p?.seconds ?? null;
+      const duration = p?.duration ?? null;
+      return `${formatClock(seconds)} / ${formatClock(duration)}`;
+    }
+    const index = p?.index ?? 0;
+    const groups = groupSections(snap.items);
+    const named = groups.some((g2) => g2.section !== null);
+    const g = groupIndexOf(groups, index);
+    if (snap.seek === "seconds") {
+      const parts = [`${formatClock(p?.seconds ?? null)} / ${formatClock(p?.duration ?? null)}`];
+      if (named) parts.push(`Section ${g + 1} of ${groups.length}`);
+      if (snap.itemPrecise ? snap.itemPrecise(index) : true) {
+        const group = groups[g];
+        const of = named && group ? group.count : snap.items.length;
+        const within = named && group ? index - group.from + 1 : index + 1;
+        parts.push(`Sentence ${Math.min(Math.max(1, within), of)} of ${of}`);
+      }
+      return parts.join(" \xB7 ");
+    }
+    const where = named ? `Section ${g + 1} of ${groups.length}` : `Sentence ${Math.min(index + 1, snap.items.length)} of ${snap.items.length}`;
+    const eta = etaSeconds(barFraction(snap), elapsedPlayingMs, index);
+    return eta == null ? where : `${where} \xB7 ${formatEta(eta)}`;
+  }
+  function fractionAt(clientX, rect) {
+    if (!(rect.width > 0)) return 0;
+    return clamp01((clientX - rect.left) / rect.width);
+  }
+  function el(doc, tag, cls, style = "") {
+    const node = doc.createElement(tag);
+    node.className = cls;
+    if (style) node.style.cssText = style;
+    return node;
+  }
+  function controlButton(doc, cls) {
+    const btn = doc.createElement("button");
+    btn.type = "button";
+    btn.className = cls;
+    btn.style.cssText = "font:inherit;font-size:.8em;line-height:1;padding:.3em .5em;color:inherit;background:transparent;border:1px solid currentColor;border-radius:.3em;cursor:pointer;opacity:.85";
+    return btn;
+  }
+  function setLabel(btn, visible, full) {
+    btn.textContent = visible;
+    btn.title = full;
+    btn.setAttribute("aria-label", full);
+  }
+  function createReadAloudPlayer(doc, host, now = () => Date.now()) {
+    const root = el(doc, "div", CLASS_ROOT, "display:flex;flex-direction:column;gap:.45em");
+    const bar = el(
+      doc,
+      "div",
+      CLASS_BAR,
+      "position:relative;height:.5em;border-radius:.25em;background:currentColor;opacity:.25;overflow:hidden"
+    );
+    const fill = el(doc, "div", CLASS_FILL, "position:absolute;left:0;top:0;bottom:0;width:0%;background:currentColor");
+    bar.append(fill);
+    const thumb = el(
+      doc,
+      "div",
+      CLASS_THUMB,
+      "position:absolute;top:50%;left:0%;width:.8em;height:.8em;border-radius:50%;background:currentColor;transform:translate(-50%,-50%);pointer-events:none"
+    );
+    const barWrap = el(doc, "div", "glassdocs-ra-bar-wrap", "position:relative;padding:.2em 0");
+    barWrap.append(bar, thumb);
+    const position = el(doc, "div", CLASS_POSITION, "font-size:.75em;opacity:.85");
+    const transport = el(doc, "div", CLASS_TRANSPORT, "display:flex;gap:.4em;align-items:center;flex-wrap:wrap");
+    const stopBtn = controlButton(doc, CLASS_STOP);
+    setLabel(stopBtn, "\u23F9", "Stop reading");
+    const prevBtn = controlButton(doc, CLASS_PREV);
+    const nextBtn = controlButton(doc, CLASS_NEXT);
+    transport.append(stopBtn, prevBtn, nextBtn);
+    const nowWrap = el(doc, "div", CLASS_NOW, "font-size:.78em");
+    const nowHead = el(doc, "div", "glassdocs-ra-head", "opacity:.6;text-transform:uppercase;letter-spacing:.05em;font-size:.9em");
+    const nowText = el(doc, "div", "glassdocs-ra-now-text", "margin-top:.15em");
+    nowWrap.append(nowHead, nowText);
+    const comingWrap = el(doc, "div", CLASS_COMING, "font-size:.78em");
+    const comingHead = el(doc, "div", "glassdocs-ra-head", "opacity:.6;text-transform:uppercase;letter-spacing:.05em;font-size:.9em");
+    comingHead.textContent = "Coming up";
+    const comingList = el(doc, "div", "glassdocs-ra-coming-list", "display:flex;flex-direction:column;gap:.1em;margin-top:.15em");
+    comingWrap.append(comingHead, comingList);
+    const readWrap = el(doc, "div", CLASS_READ, "font-size:.78em");
+    const readToggle = doc.createElement("button");
+    readToggle.type = "button";
+    readToggle.className = "glassdocs-ra-read-toggle";
+    readToggle.style.cssText = "font:inherit;font-size:.9em;padding:0;color:inherit;background:transparent;border:0;cursor:pointer;opacity:.6;text-transform:uppercase;letter-spacing:.05em";
+    const readList = el(doc, "div", "glassdocs-ra-read-list", "margin-top:.15em;opacity:.75");
+    let readOpen = false;
+    readList.hidden = true;
+    readWrap.append(readToggle, readList);
+    readToggle.addEventListener("click", () => {
+      readOpen = !readOpen;
+      readList.hidden = !readOpen;
+      readToggle.textContent = readOpen ? "Read \u25BE" : "Read \u25B8";
+      readToggle.setAttribute("aria-expanded", readOpen ? "true" : "false");
+    });
+    readToggle.textContent = "Read \u25B8";
+    readToggle.setAttribute("aria-expanded", "false");
+    root.append(barWrap, position, transport, nowWrap, comingWrap, readWrap);
+    let snap = { state: "idle", items: [], seek: null, progress: null };
+    let elapsedMs = 0;
+    let playingSince = null;
+    const elapsedPlaying = () => elapsedMs + (playingSince == null ? 0 : Math.max(0, now() - playingSince));
+    const phase = (state) => {
+      if (state === "playing") {
+        if (playingSince == null) playingSince = now();
+        return;
+      }
+      if (playingSince != null) {
+        elapsedMs += Math.max(0, now() - playingSince);
+        playingSince = null;
+      }
+      if (state === "idle") elapsedMs = 0;
+    };
+    let dragging = false;
+    let dragFraction = 0;
+    let dragPointerId = null;
+    let pointerCommitted = false;
+    const seekableSeconds = () => {
+      if (snap.seek !== "seconds") return null;
+      const duration = snap.progress?.duration ?? null;
+      return duration != null && duration > 0 ? duration : null;
+    };
+    const previewAt = (clientX) => {
+      dragFraction = fractionAt(clientX, bar.getBoundingClientRect());
+    };
+    const commitDrag = () => {
+      if (!dragging) return;
+      dragging = false;
+      const id = dragPointerId;
+      dragPointerId = null;
+      if (id != null) {
+        try {
+          bar.releasePointerCapture(id);
+        } catch {
+        }
+      }
+      pointerCommitted = true;
+      const duration = seekableSeconds();
+      if (duration != null) host.seekTo(dragFraction * duration);
+      render(snap);
+    };
+    bar.addEventListener("pointerdown", (event) => {
+      if (seekableSeconds() == null) return;
+      const pe = event;
+      if (typeof pe.clientX !== "number") return;
+      pointerCommitted = false;
+      dragging = true;
+      dragPointerId = null;
+      if (typeof pe.pointerId === "number") {
+        try {
+          bar.setPointerCapture(pe.pointerId);
+          dragPointerId = pe.pointerId;
+        } catch {
+        }
+      }
+      previewAt(pe.clientX);
+      render(snap);
+    });
+    bar.addEventListener("pointermove", (event) => {
+      if (!dragging) return;
+      const pe = event;
+      if (typeof pe.clientX !== "number") return;
+      previewAt(pe.clientX);
+      render(snap);
+    });
+    bar.addEventListener("pointerup", (event) => {
+      if (!dragging) return;
+      const pe = event;
+      if (typeof pe.clientX === "number") previewAt(pe.clientX);
+      commitDrag();
+    });
+    bar.addEventListener("pointercancel", () => commitDrag());
+    bar.addEventListener("lostpointercapture", () => commitDrag());
+    bar.addEventListener("keydown", (event) => {
+      const duration = seekableSeconds();
+      if (duration == null) return;
+      const ke = event;
+      const at = snap.progress?.seconds ?? 0;
+      let target;
+      switch (ke.key) {
+        case "ArrowLeft":
+          target = at - KEY_NUDGE_SECONDS;
+          break;
+        case "ArrowRight":
+          target = at + KEY_NUDGE_SECONDS;
+          break;
+        case "ArrowDown":
+          target = at - KEY_STEP_SECONDS;
+          break;
+        case "ArrowUp":
+          target = at + KEY_STEP_SECONDS;
+          break;
+        case "PageUp":
+          target = at - SKIP_SECONDS;
+          break;
+        case "PageDown":
+          target = at + SKIP_SECONDS;
+          break;
+        case "Home":
+          target = 0;
+          break;
+        case "End":
+          target = duration;
+          break;
+        default:
+          return;
+      }
+      ke.preventDefault();
+      host.seekTo(Math.min(duration, Math.max(0, target)));
+    });
+    bar.addEventListener("click", (event) => {
+      if (dragging) return;
+      if (pointerCommitted) {
+        pointerCommitted = false;
+        return;
+      }
+      if (snap.seek !== "seconds") return;
+      const duration = snap.progress?.duration ?? null;
+      if (duration == null || duration <= 0) return;
+      const rect = bar.getBoundingClientRect();
+      const x = event.clientX;
+      if (typeof x !== "number") return;
+      host.seekTo(fractionAt(x, rect) * duration);
+    });
+    stopBtn.addEventListener("click", () => host.stop());
+    prevBtn.addEventListener("click", () => {
+      if (snap.seek === "seconds") {
+        host.seekTo(Math.max(0, (snap.progress?.seconds ?? 0) - SKIP_SECONDS));
+        return;
+      }
+      if (snap.seek === "item") host.seekTo((snap.progress?.index ?? 0) - 1);
+    });
+    nextBtn.addEventListener("click", () => {
+      if (snap.seek === "seconds") {
+        host.seekTo((snap.progress?.seconds ?? 0) + SKIP_SECONDS);
+        return;
+      }
+      if (snap.seek === "item") host.seekTo((snap.progress?.index ?? 0) + 1);
+    });
+    const sectionRow = (group, clickable) => {
+      const name = group.section?.text ?? "Introduction";
+      const count = `${group.count} sentence${group.count === 1 ? "" : "s"}`;
+      if (!clickable) {
+        const row2 = el(doc, "div", CLASS_SECTION_ROW, "display:flex;justify-content:space-between;gap:.6em");
+        const label2 = doc.createElement("span");
+        label2.textContent = name;
+        const n2 = doc.createElement("span");
+        n2.style.cssText = "opacity:.6;white-space:nowrap";
+        n2.textContent = count;
+        row2.append(label2, n2);
+        return row2;
+      }
+      const row = doc.createElement("button");
+      row.type = "button";
+      row.className = CLASS_SECTION_ROW;
+      row.style.cssText = "display:flex;justify-content:space-between;gap:.6em;width:100%;font:inherit;text-align:left;padding:.15em 0;color:inherit;background:transparent;border:0;cursor:pointer";
+      const label = doc.createElement("span");
+      label.textContent = name;
+      const n = doc.createElement("span");
+      n.style.cssText = "opacity:.6;white-space:nowrap";
+      n.textContent = count;
+      row.append(label, n);
+      row.title = `Jump to ${name}`;
+      row.setAttribute("aria-label", `Jump to ${name}`);
+      row.addEventListener("click", () => {
+        if (host.seekToItem) host.seekToItem(group.from);
+        else host.seekTo(group.from);
+      });
+      return row;
+    };
+    const render = (next) => {
+      phase(next.state);
+      snap = next;
+      const hasTimeline = next.seek === "seconds";
+      const duration = next.progress?.duration ?? null;
+      const previewing = dragging && hasTimeline && duration != null && duration > 0;
+      const fraction = previewing ? dragFraction : barFraction(next);
+      fill.style.width = `${Math.round(fraction * 1e3) / 10}%`;
+      bar.setAttribute("role", hasTimeline ? "slider" : "progressbar");
+      bar.setAttribute("aria-valuemin", "0");
+      bar.setAttribute("aria-valuemax", "100");
+      bar.setAttribute("aria-valuenow", String(Math.round(fraction * 100)));
+      bar.setAttribute("aria-label", hasTimeline ? "Seek" : "Reading progress");
+      bar.tabIndex = hasTimeline ? 0 : -1;
+      bar.style.touchAction = hasTimeline ? "none" : "";
+      bar.style.userSelect = hasTimeline ? "none" : "";
+      bar.style.cursor = hasTimeline ? dragging ? "grabbing" : "grab" : "default";
+      thumb.hidden = !hasTimeline;
+      thumb.style.left = `${Math.round(fraction * 1e3) / 10}%`;
+      const line = positionLine(
+        previewing ? { ...next, progress: { ...next.progress, seconds: dragFraction * duration } } : next,
+        elapsedPlaying()
+      );
+      position.textContent = hasTimeline ? line : `${Math.round(fraction * 100)}% \xB7 ${line}`;
+      if (hasTimeline) bar.setAttribute("aria-valuetext", line);
+      else bar.removeAttribute("aria-valuetext");
+      const canSeek = next.seek !== null;
+      prevBtn.hidden = !canSeek;
+      nextBtn.hidden = !canSeek;
+      if (hasTimeline) {
+        setLabel(prevBtn, `\u23EA ${SKIP_SECONDS} s`, `Skip back ${SKIP_SECONDS} seconds`);
+        setLabel(nextBtn, `\u23E9 ${SKIP_SECONDS} s`, `Skip forward ${SKIP_SECONDS} seconds`);
+      } else if (canSeek) {
+        setLabel(prevBtn, "\u23EE Previous sentence", "Previous sentence");
+        setLabel(nextBtn, "\u23ED Next sentence", "Next sentence");
+      }
+      const hasQueue = next.items.length > 0;
+      nowWrap.hidden = !hasQueue;
+      comingWrap.hidden = !hasQueue;
+      readWrap.hidden = !hasQueue;
+      if (!hasQueue) return;
+      const index = Math.min(next.progress?.index ?? 0, next.items.length - 1);
+      const precise = next.itemPrecise ? next.itemPrecise(index) : true;
+      nowHead.textContent = next.state === "paused" ? precise ? "\u23F8 Paused at" : "\u23F8 Paused \xB7 in this section" : precise ? "Now" : "Now \xB7 in this section";
+      nowText.textContent = `\u201C${next.items[index].text}\u201D`;
+      const groups = groupSections(next.items);
+      const g = groupIndexOf(groups, index);
+      comingList.replaceChildren();
+      const upcoming = groups.slice(g + 1);
+      if (upcoming.length === 0) {
+        const done = el(doc, "div", "glassdocs-ra-coming-empty", "opacity:.6");
+        done.textContent = "Nothing left after this section.";
+        comingList.append(done);
+      } else {
+        for (const group of upcoming) comingList.append(sectionRow(group, canSeek));
+      }
+      readList.replaceChildren();
+      const read = groups.slice(0, Math.max(0, g));
+      readToggle.hidden = read.length === 0;
+      readList.hidden = !readOpen || read.length === 0;
+      if (read.length > 0) {
+        for (const group of read) readList.append(sectionRow(group, canSeek));
+      }
+    };
+    return { el: root, render };
+  }
+
   // src/sidepanel/clip-source.ts
   var NO_ITEMS = Object.freeze([]);
   var CLIP_LABEL = "AI voice";
-  function createClipSource(doc, url) {
+  var TRUST_FLOOR = 20;
+  var TRUST_BAND = 0.05;
+  function alignGroups(items, sections) {
+    if (items.length === 0 || sections.length === 0) return null;
+    const groups = groupSections(items);
+    if (groups[0].section !== null) groups.unshift({ section: null, from: 0, count: 0 });
+    if (groups.length !== sections.length) return null;
+    return groups;
+  }
+  function createClipSource(doc, url, timeline) {
     const el2 = doc.createElement("audio");
     el2.preload = "none";
     el2.src = url;
+    const sections = timeline?.sections ?? null;
+    const groups = timeline && sections ? alignGroups(timeline.items, sections) : null;
+    const items = groups ? timeline.items : NO_ITEMS;
+    const trusted = (groups ?? []).map((group, g) => {
+      let pageChars = 0;
+      for (let i = group.from; i < group.from + group.count; i++) pageChars += items[i].text.length;
+      const generatorChars = sections[g].chars;
+      return Math.abs(pageChars - generatorChars) <= Math.max(TRUST_FLOOR, TRUST_BAND * generatorChars);
+    });
+    const sectionAt = (t) => {
+      let s = 0;
+      for (let k = 0; k < sections.length; k++) {
+        if (sections[k].start <= t) s = k;
+        else break;
+      }
+      return s;
+    };
+    const itemAt = (t) => {
+      if (!groups || !sections) return 0;
+      const at = Number.isFinite(t) ? Math.max(0, t) : 0;
+      const s = sectionAt(at);
+      const group = groups[s];
+      if (group.count === 0) return group.from;
+      const start = sections[s].start;
+      const upper = s + 1 < sections.length ? sections[s + 1].start : Number.isFinite(el2.duration) ? el2.duration : start;
+      const span = upper - start;
+      const frac = span > 0 ? Math.min(1, Math.max(0, (at - start) / span)) : 0;
+      let total = 0;
+      for (let i = group.from; i < group.from + group.count; i++) total += items[i].text.length;
+      if (total <= 0) return group.from;
+      let acc = 0;
+      for (let i = group.from; i < group.from + group.count; i++) {
+        acc += items[i].text.length;
+        if (acc / total > frac) return i;
+      }
+      return group.from + group.count - 1;
+    };
+    const secondsForItem = (index) => {
+      if (!groups || !sections) return null;
+      const g = groupIndexOf(groups, index);
+      if (g < 0) return null;
+      return sections[g].start;
+    };
+    const seekSeconds = (seconds) => {
+      el2.currentTime = Math.min(el2.duration || 0, Math.max(0, seconds));
+      emitProgress();
+    };
     const endedFns = [];
     const errorFns = [];
     const progressFns = [];
     const emitProgress = () => {
       const p = {
-        index: 0,
-        total: 1,
+        index: itemAt(el2.currentTime),
+        total: items.length > 0 ? items.length : 1,
+        // STAYS NULL, with a timeline or without one. The map is per SECTION; there
+        // is no character-level fact here, and manufacturing one would be exactly
+        // the defect the trust check above exists to prevent.
         charIndex: null,
         seconds: Number.isFinite(el2.currentTime) ? el2.currentTime : 0,
         duration: Number.isFinite(el2.duration) ? el2.duration : null
@@ -262,14 +757,34 @@
       },
       // onYielded is deliberately absent — see the header.
       // ── position and seeking (#214) ──────────────────────────────────
-      items: NO_ITEMS,
+      items,
       /** Native, exact and continuous. The player's bar is draggable for this
        *  source and this source only, because this is the only one that can land
        *  where the reader put the thumb. */
       seek: "seconds",
+      /**
+       * A section row was clicked, and it carries an ITEM index — which is not a
+       * position this source can be given. Translate to the item's SECTION START,
+       * which is the one instant in the clip the map vouches for exactly.
+       *
+       * Deliberately not the item's own estimated offset: that would be a
+       * character-weighted guess dressed up as a seek target, and the reader would
+       * land somewhere the row did not promise. The row says "jump to this
+       * section" and that is what happens.
+       */
+      seekToItem(index) {
+        const seconds = secondsForItem(index);
+        if (seconds == null) return;
+        seekSeconds(seconds);
+      },
+      /** False for a section whose page text and the generator's disagree. */
+      itemPrecise(index) {
+        if (!groups) return false;
+        const g = groupIndexOf(groups, index);
+        return g < 0 ? false : trusted[g] === true;
+      },
       seekTo(seconds) {
-        el2.currentTime = Math.min(el2.duration || 0, Math.max(0, seconds));
-        emitProgress();
+        seekSeconds(seconds);
       },
       onProgress(fn) {
         progressFns.push(fn);
@@ -366,288 +881,18 @@
       seekTo(position) {
         source?.seekTo(position);
       },
-      items: () => source?.items ?? []
+      seekToItem(index) {
+        const s = source;
+        if (!s) return;
+        if (typeof s.seekToItem === "function") s.seekToItem(index);
+        else s.seekTo(index);
+      },
+      items: () => source?.items ?? [],
+      // Absent means yes: a source that says nothing about precision is exact,
+      // which is true of the speech engine and of an idle transport with nothing
+      // to be imprecise about.
+      itemPrecise: (index) => source?.itemPrecise?.(index) ?? true
     };
-  }
-
-  // src/sidepanel/read-aloud-player.ts
-  var SKIP_SECONDS = 10;
-  var CLASS_ROOT = "glassdocs-ra-player";
-  var CLASS_BAR = "glassdocs-ra-bar";
-  var CLASS_FILL = "glassdocs-ra-fill";
-  var CLASS_POSITION = "glassdocs-ra-position";
-  var CLASS_TRANSPORT = "glassdocs-ra-transport";
-  var CLASS_STOP = "glassdocs-ra-stop";
-  var CLASS_PREV = "glassdocs-ra-prev";
-  var CLASS_NEXT = "glassdocs-ra-next";
-  var CLASS_NOW = "glassdocs-ra-now";
-  var CLASS_COMING = "glassdocs-ra-coming";
-  var CLASS_READ = "glassdocs-ra-read";
-  var CLASS_SECTION_ROW = "glassdocs-ra-section";
-  function groupSections(items) {
-    const out = [];
-    for (let i = 0; i < items.length; i++) {
-      const section = items[i].section;
-      const last = out[out.length - 1];
-      if (last && last.section === section) last.count++;
-      else out.push({ section, from: i, count: 1 });
-    }
-    return out;
-  }
-  function groupIndexOf(groups, index) {
-    for (let g = groups.length - 1; g >= 0; g--) if (index >= groups[g].from) return g;
-    return groups.length ? 0 : -1;
-  }
-  function totalChars(items) {
-    let n = 0;
-    for (const item of items) n += item.text.length;
-    return n;
-  }
-  function charsBefore(items, index) {
-    let n = 0;
-    for (let i = 0; i < index && i < items.length; i++) n += items[i].text.length;
-    return n;
-  }
-  function barFraction(snap) {
-    if (snap.state === "ended") return 1;
-    const p = snap.progress;
-    if (!p) return 0;
-    if (snap.seek === "seconds" || snap.items.length === 0) {
-      if (p.duration == null || p.duration <= 0 || p.seconds == null) return 0;
-      return clamp01(p.seconds / p.duration);
-    }
-    const total = totalChars(snap.items);
-    if (total <= 0) return 0;
-    const done = charsBefore(snap.items, p.index) + (p.charIndex ?? 0);
-    return clamp01(done / total);
-  }
-  function clamp01(n) {
-    if (!Number.isFinite(n)) return 0;
-    return Math.min(1, Math.max(0, n));
-  }
-  function etaSeconds(fraction, elapsedPlayingMs, completedItems) {
-    if (completedItems < 1) return null;
-    if (!(fraction > 0) || fraction >= 1) return null;
-    if (!(elapsedPlayingMs > 0)) return null;
-    return elapsedPlayingMs / 1e3 * ((1 - fraction) / fraction);
-  }
-  function formatEta(seconds) {
-    if (seconds < 45) return "about a minute left (est.)";
-    const mins = Math.round(seconds / 60);
-    if (mins < 60) return `about ${Math.max(1, mins)} min left (est.)`;
-    const hours = Math.floor(mins / 60);
-    const rest = mins % 60;
-    return `about ${hours} h ${rest} min left (est.)`;
-  }
-  function formatClock(seconds) {
-    if (seconds == null || !Number.isFinite(seconds) || seconds < 0) return "\u2013:\u2013";
-    const whole = Math.floor(seconds);
-    const m = Math.floor(whole / 60);
-    const s = whole % 60;
-    return `${m}:${s < 10 ? "0" : ""}${s}`;
-  }
-  function positionLine(snap, elapsedPlayingMs) {
-    const p = snap.progress;
-    if (snap.items.length === 0) {
-      const seconds = p?.seconds ?? null;
-      const duration = p?.duration ?? null;
-      return `${formatClock(seconds)} / ${formatClock(duration)}`;
-    }
-    const index = p?.index ?? 0;
-    const groups = groupSections(snap.items);
-    const named = groups.some((g2) => g2.section !== null);
-    const g = groupIndexOf(groups, index);
-    const where = named ? `Section ${g + 1} of ${groups.length}` : `Sentence ${Math.min(index + 1, snap.items.length)} of ${snap.items.length}`;
-    const eta = etaSeconds(barFraction(snap), elapsedPlayingMs, index);
-    return eta == null ? where : `${where} \xB7 ${formatEta(eta)}`;
-  }
-  function fractionAt(clientX, rect) {
-    if (!(rect.width > 0)) return 0;
-    return clamp01((clientX - rect.left) / rect.width);
-  }
-  function el(doc, tag, cls, style = "") {
-    const node = doc.createElement(tag);
-    node.className = cls;
-    if (style) node.style.cssText = style;
-    return node;
-  }
-  function controlButton(doc, cls) {
-    const btn = doc.createElement("button");
-    btn.type = "button";
-    btn.className = cls;
-    btn.style.cssText = "font:inherit;font-size:.8em;line-height:1;padding:.3em .5em;color:inherit;background:transparent;border:1px solid currentColor;border-radius:.3em;cursor:pointer;opacity:.85";
-    return btn;
-  }
-  function setLabel(btn, visible, full) {
-    btn.textContent = visible;
-    btn.title = full;
-    btn.setAttribute("aria-label", full);
-  }
-  function createReadAloudPlayer(doc, host, now = () => Date.now()) {
-    const root = el(doc, "div", CLASS_ROOT, "display:flex;flex-direction:column;gap:.45em");
-    const bar = el(
-      doc,
-      "div",
-      CLASS_BAR,
-      "position:relative;height:.5em;border-radius:.25em;background:currentColor;opacity:.25;overflow:hidden"
-    );
-    const fill = el(doc, "div", CLASS_FILL, "position:absolute;left:0;top:0;bottom:0;width:0%;background:currentColor");
-    bar.append(fill);
-    const barWrap = el(doc, "div", "glassdocs-ra-bar-wrap", "padding:.2em 0");
-    barWrap.append(bar);
-    const position = el(doc, "div", CLASS_POSITION, "font-size:.75em;opacity:.85");
-    const transport = el(doc, "div", CLASS_TRANSPORT, "display:flex;gap:.4em;align-items:center;flex-wrap:wrap");
-    const stopBtn = controlButton(doc, CLASS_STOP);
-    setLabel(stopBtn, "\u23F9", "Stop reading");
-    const prevBtn = controlButton(doc, CLASS_PREV);
-    const nextBtn = controlButton(doc, CLASS_NEXT);
-    transport.append(stopBtn, prevBtn, nextBtn);
-    const nowWrap = el(doc, "div", CLASS_NOW, "font-size:.78em");
-    const nowHead = el(doc, "div", "glassdocs-ra-head", "opacity:.6;text-transform:uppercase;letter-spacing:.05em;font-size:.9em");
-    const nowText = el(doc, "div", "glassdocs-ra-now-text", "margin-top:.15em");
-    nowWrap.append(nowHead, nowText);
-    const comingWrap = el(doc, "div", CLASS_COMING, "font-size:.78em");
-    const comingHead = el(doc, "div", "glassdocs-ra-head", "opacity:.6;text-transform:uppercase;letter-spacing:.05em;font-size:.9em");
-    comingHead.textContent = "Coming up";
-    const comingList = el(doc, "div", "glassdocs-ra-coming-list", "display:flex;flex-direction:column;gap:.1em;margin-top:.15em");
-    comingWrap.append(comingHead, comingList);
-    const readWrap = el(doc, "div", CLASS_READ, "font-size:.78em");
-    const readToggle = doc.createElement("button");
-    readToggle.type = "button";
-    readToggle.className = "glassdocs-ra-read-toggle";
-    readToggle.style.cssText = "font:inherit;font-size:.9em;padding:0;color:inherit;background:transparent;border:0;cursor:pointer;opacity:.6;text-transform:uppercase;letter-spacing:.05em";
-    const readList = el(doc, "div", "glassdocs-ra-read-list", "margin-top:.15em;opacity:.75");
-    let readOpen = false;
-    readList.hidden = true;
-    readWrap.append(readToggle, readList);
-    readToggle.addEventListener("click", () => {
-      readOpen = !readOpen;
-      readList.hidden = !readOpen;
-      readToggle.textContent = readOpen ? "Read \u25BE" : "Read \u25B8";
-      readToggle.setAttribute("aria-expanded", readOpen ? "true" : "false");
-    });
-    readToggle.textContent = "Read \u25B8";
-    readToggle.setAttribute("aria-expanded", "false");
-    root.append(barWrap, position, transport, nowWrap, comingWrap, readWrap);
-    let snap = { state: "idle", items: [], seek: null, progress: null };
-    let elapsedMs = 0;
-    let playingSince = null;
-    const elapsedPlaying = () => elapsedMs + (playingSince == null ? 0 : Math.max(0, now() - playingSince));
-    const phase = (state) => {
-      if (state === "playing") {
-        if (playingSince == null) playingSince = now();
-        return;
-      }
-      if (playingSince != null) {
-        elapsedMs += Math.max(0, now() - playingSince);
-        playingSince = null;
-      }
-      if (state === "idle") elapsedMs = 0;
-    };
-    bar.addEventListener("click", (event) => {
-      if (snap.seek !== "seconds") return;
-      const duration = snap.progress?.duration ?? null;
-      if (duration == null || duration <= 0) return;
-      const rect = bar.getBoundingClientRect();
-      const x = event.clientX;
-      if (typeof x !== "number") return;
-      host.seekTo(fractionAt(x, rect) * duration);
-    });
-    stopBtn.addEventListener("click", () => host.stop());
-    prevBtn.addEventListener("click", () => {
-      if (snap.seek === "seconds") {
-        host.seekTo(Math.max(0, (snap.progress?.seconds ?? 0) - SKIP_SECONDS));
-        return;
-      }
-      if (snap.seek === "item") host.seekTo((snap.progress?.index ?? 0) - 1);
-    });
-    nextBtn.addEventListener("click", () => {
-      if (snap.seek === "seconds") {
-        host.seekTo((snap.progress?.seconds ?? 0) + SKIP_SECONDS);
-        return;
-      }
-      if (snap.seek === "item") host.seekTo((snap.progress?.index ?? 0) + 1);
-    });
-    const sectionRow = (group, clickable) => {
-      const name = group.section?.text ?? "Introduction";
-      const count = `${group.count} sentence${group.count === 1 ? "" : "s"}`;
-      if (!clickable) {
-        const row2 = el(doc, "div", CLASS_SECTION_ROW, "display:flex;justify-content:space-between;gap:.6em");
-        const label2 = doc.createElement("span");
-        label2.textContent = name;
-        const n2 = doc.createElement("span");
-        n2.style.cssText = "opacity:.6;white-space:nowrap";
-        n2.textContent = count;
-        row2.append(label2, n2);
-        return row2;
-      }
-      const row = doc.createElement("button");
-      row.type = "button";
-      row.className = CLASS_SECTION_ROW;
-      row.style.cssText = "display:flex;justify-content:space-between;gap:.6em;width:100%;font:inherit;text-align:left;padding:.15em 0;color:inherit;background:transparent;border:0;cursor:pointer";
-      const label = doc.createElement("span");
-      label.textContent = name;
-      const n = doc.createElement("span");
-      n.style.cssText = "opacity:.6;white-space:nowrap";
-      n.textContent = count;
-      row.append(label, n);
-      row.title = `Jump to ${name}`;
-      row.setAttribute("aria-label", `Jump to ${name}`);
-      row.addEventListener("click", () => host.seekTo(group.from));
-      return row;
-    };
-    const render = (next) => {
-      phase(next.state);
-      snap = next;
-      const fraction = barFraction(next);
-      fill.style.width = `${Math.round(fraction * 1e3) / 10}%`;
-      const hasTimeline = next.seek === "seconds";
-      bar.setAttribute("role", hasTimeline ? "slider" : "progressbar");
-      bar.setAttribute("aria-valuemin", "0");
-      bar.setAttribute("aria-valuemax", "100");
-      bar.setAttribute("aria-valuenow", String(Math.round(fraction * 100)));
-      bar.setAttribute("aria-label", hasTimeline ? "Seek" : "Reading progress");
-      bar.style.cursor = hasTimeline ? "pointer" : "default";
-      const line = positionLine(next, elapsedPlaying());
-      position.textContent = hasTimeline ? line : `${Math.round(fraction * 100)}% \xB7 ${line}`;
-      const canSeek = next.seek !== null;
-      prevBtn.hidden = !canSeek;
-      nextBtn.hidden = !canSeek;
-      if (hasTimeline) {
-        setLabel(prevBtn, `\u23EA ${SKIP_SECONDS} s`, `Skip back ${SKIP_SECONDS} seconds`);
-        setLabel(nextBtn, `\u23E9 ${SKIP_SECONDS} s`, `Skip forward ${SKIP_SECONDS} seconds`);
-      } else if (canSeek) {
-        setLabel(prevBtn, "\u23EE Previous sentence", "Previous sentence");
-        setLabel(nextBtn, "\u23ED Next sentence", "Next sentence");
-      }
-      const hasQueue = next.items.length > 0;
-      nowWrap.hidden = !hasQueue;
-      comingWrap.hidden = !hasQueue;
-      readWrap.hidden = !hasQueue;
-      if (!hasQueue) return;
-      const index = Math.min(next.progress?.index ?? 0, next.items.length - 1);
-      nowHead.textContent = next.state === "paused" ? "\u23F8 Paused at" : "Now";
-      nowText.textContent = `\u201C${next.items[index].text}\u201D`;
-      const groups = groupSections(next.items);
-      const g = groupIndexOf(groups, index);
-      comingList.replaceChildren();
-      const upcoming = groups.slice(g + 1);
-      if (upcoming.length === 0) {
-        const done = el(doc, "div", "glassdocs-ra-coming-empty", "opacity:.6");
-        done.textContent = "Nothing left after this section.";
-        comingList.append(done);
-      } else {
-        for (const group of upcoming) comingList.append(sectionRow(group, canSeek));
-      }
-      readList.replaceChildren();
-      const read = groups.slice(0, Math.max(0, g));
-      readToggle.hidden = read.length === 0;
-      readList.hidden = !readOpen || read.length === 0;
-      if (read.length > 0) {
-        for (const group of read) readList.append(sectionRow(group, canSeek));
-      }
-    };
-    return { el: root, render };
   }
 
   // src/sidepanel/speech-source.ts
@@ -1019,15 +1264,19 @@
     let pending = voice ? "tts" : "clip";
     let active = null;
     const resolve = () => {
+      const blocks = readableBlocks(mainContentRoot(doc));
       if (pending === "clip") {
         if (!clip) return null;
-        const source2 = createClipSource(doc, clip.file);
+        const source2 = createClipSource(
+          doc,
+          clip.file,
+          clip.sections ? { sections: clip.sections, items: toChunks(blocks) } : void 0
+        );
         active = "clip";
         postReadAloudSignal(READ_ALOUD_STARTED);
         return source2;
       }
       if (!voice) return null;
-      const blocks = readableBlocks(mainContentRoot(doc));
       const source = createSpeechSourceWith(blocks, voice);
       if (source) {
         active = "tts";
@@ -1038,6 +1287,9 @@
     const transport = createTransport(resolve);
     const player = createReadAloudPlayer(doc, {
       seekTo: (position) => transport.seekTo(position),
+      // A section row's number is an ITEM index; only the source knows what that
+      // means in its own unit (#301).
+      seekToItem: (index) => transport.seekToItem(index),
       stop: () => transport.stop()
     });
     const popover = doc.createElement("div");
@@ -1052,7 +1304,8 @@
         state: transport.state(),
         items: transport.items(),
         seek: transport.seekUnit(),
-        progress
+        progress,
+        itemPrecise: (index) => transport.itemPrecise(index)
       });
     };
     const CLAMP_MARGIN = 8;
@@ -1140,7 +1393,8 @@
     const probe = doc.createElement("audio");
     if (typeof probe.canPlayType !== "function") return null;
     if (probe.canPlayType(mime) === "") return null;
-    return { file: verdict.file };
+    const raw = doc.querySelector('meta[name="audio-sections"]')?.getAttribute("content");
+    return { file: verdict.file, sections: parseAudioSections(raw) };
   }
   async function initReadAloudPage(doc = document) {
     const root = mainContentRoot(doc);

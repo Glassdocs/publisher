@@ -123,6 +123,22 @@ const AUDIO_FILE_RE = /^\/audio\/gd-audio-[0-9a-f]{20}\.[A-Za-z0-9]+$/;
 const SHA_RE = /^[0-9a-f]{40}$/;
 
 /**
+ * The section timeline (#300): `t:c` per section, comma-joined — a start offset
+ * in DECISECONDS and a spoken-character COUNT, integers and nothing else.
+ *
+ * The third copy of the same rule, beside published-audio.ts's
+ * AUDIO_SECTIONS_RE and server/functions/…/audio/complete.ts's. It is OPTIONAL
+ * in a way `audio-file`/`audio-sha` are not: every clip generated before #300
+ * has no map at all, and its manifest entry carries `sections: null`. A missing
+ * or malformed map is DROPPED SILENTLY — the page keeps its ▶ AI, it simply has
+ * no section readout — where a malformed `file` or `source_sha` is counted as a
+ * rejection, because those two are the pair a clip cannot be played without.
+ */
+const AUDIO_SECTIONS_RE = /^\d+:\d+(,\d+:\d+)*$/;
+/** Same ceiling as the generator and the reader; past it the map is not carried. */
+const AUDIO_SECTIONS_MAX = 8192;
+
+/**
  * Read $SITE_DIR/audio/manifest.json into a Map keyed by REPO SOURCE PATH.
  *
  * The key is the join: the manifest is built with `key: .path` from each clip's
@@ -188,7 +204,14 @@ export function loadAudioManifest(file, read = readFileSync) {
       rejected++;
       continue;
     }
-    out.set(sourcePath, { file: entry.file, sourceSha: entry.source_sha });
+    // Optional and independently validated. Never a reason to reject the entry.
+    const sections =
+      typeof entry.sections === "string" &&
+      entry.sections.length <= AUDIO_SECTIONS_MAX &&
+      AUDIO_SECTIONS_RE.test(entry.sections)
+        ? entry.sections
+        : null;
+    out.set(sourcePath, { file: entry.file, sourceSha: entry.source_sha, sections });
   }
   if (rejected) {
     console.warn(
@@ -307,7 +330,13 @@ const READ_ALOUD_SRC = "/assets/glassdocs-read-aloud.js";
 // audio-sha with no file names nothing, and a file with no version is a clip
 // nothing can vouch for, which is exactly the fail-open #94 wrote the rule
 // against.
-export function injectInto(html, repo, sourcePath, sourceSha, release, audioFile, audioSha) {
+//
+// `audioSections` (#300) is a THIRD optional value and rides the pair: it is
+// emitted only where `audio-file` and `audio-sha` are already emitted, never on
+// its own. That gating is what makes the map unable to outlive its clip — a page
+// whose audio-sha has moved renders no ▶ AI at all, so it can never reach code
+// that would apply a map, and a page with no clip carries no map to misapply.
+export function injectInto(html, repo, sourcePath, sourceSha, release, audioFile, audioSha, audioSections) {
   // Strip exactly what this function inserted, and nothing else: the block's own
   // indent (`[ \t]*`, horizontal only) and its own closing newline (`\n?`, see
   // `block` below). That precision is the whole fixed-point property.
@@ -344,6 +373,9 @@ export function injectInto(html, repo, sourcePath, sourceSha, release, audioFile
     (sourcePath && sourceSha ? `  <meta name="source-sha" content="${escapeAttr(sourceSha)}">\n` : "") +
     (audioFile && audioSha ? `  <meta name="audio-file" content="${escapeAttr(audioFile)}">\n` : "") +
     (audioFile && audioSha ? `  <meta name="audio-sha" content="${escapeAttr(audioSha)}">\n` : "") +
+    (audioFile && audioSha && audioSections
+      ? `  <meta name="audio-sections" content="${escapeAttr(audioSections)}">\n`
+      : "") +
     (release ? `  <meta name="glassdocs-release" content="${escapeAttr(release)}">\n` : "") +
     `  <script defer src="${READ_ALOUD_SRC}"></script>\n` +
     `  ${END}\n`;
@@ -365,6 +397,8 @@ function main() {
   let injected = 0;
   let versioned = 0;
   let audible = 0;
+  /** Pages that also got a section map (#300). Always ≤ `audible`, by the gate above. */
+  let sectioned = 0;
   // The build ran in the checked-out repo, so each page's Markdown is on disk
   // and can be hashed once. Cache by source path: section landings map several
   // built pages to one source on some layouts.
@@ -389,12 +423,14 @@ function main() {
       args.release,
       clip?.file ?? null,
       clip?.sourceSha ?? null,
+      clip?.sections ?? null,
     );
     if (out == null) continue; // no <head>
     writeFileSync(f, out);
     injected++;
     if (sha) versioned++;
     if (clip) audible++;
+    if (clip?.sections) sectioned++;
   }
   console.log(
     `inject-source-meta: source-repo=${args.repo} into ${injected}/${files.length} page(s); ` +
@@ -403,6 +439,11 @@ function main() {
       // that also carries a version, so "audio on 3" against "source-sha on 19"
       // is the sentence a tenant needs to read the feature's reach off a deploy.
       `audio on ${audible}; ` +
+      // Beside it for the same reason: a section map is only ever stamped on a
+      // page that already got audio, so "sections on 0" against "audio on 17" is
+      // the one line that says a tenant's clips predate #300 and will carry no
+      // readout until they are regenerated.
+      `sections on ${sectioned}; ` +
       `glassdocs-release=${args.release || "(none — pages will carry no release stamp)"}.`,
   );
 }

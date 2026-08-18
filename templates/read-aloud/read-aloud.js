@@ -206,6 +206,195 @@
     }
   }
 
+  // src/lib/playback-position.ts
+  var POS_KEY = "glassdocs.readaloud.pos.v1";
+  var CHAIN_RUN_KEY = "glassdocs.readaloud.run";
+  var MAX_ENTRIES = 50;
+  var MAX_AGE_MS = 90 * 24 * 60 * 60 * 1e3;
+  var WRITE_THROTTLE_MS = 5e3;
+  var END_SECONDS = 10;
+  function fingerprintChunks(chunks) {
+    let h = 2166136261;
+    let chars = 0;
+    for (const c of chunks) {
+      chars += c.length;
+      for (let i = 0; i < c.length; i++) {
+        h ^= c.charCodeAt(i);
+        h = Math.imul(h, 16777619);
+      }
+      h ^= 10;
+      h = Math.imul(h, 16777619);
+    }
+    return `${chunks.length}.${chars}.${(h >>> 0).toString(36)}`;
+  }
+  function store() {
+    try {
+      return globalThis.localStorage ?? null;
+    } catch {
+      return null;
+    }
+  }
+  function sessionStore() {
+    try {
+      return globalThis.sessionStorage ?? null;
+    } catch {
+      return null;
+    }
+  }
+  function readChainRun() {
+    try {
+      const v = sessionStore()?.getItem(CHAIN_RUN_KEY);
+      return v === "tts" || v === "clip" ? v : null;
+    } catch {
+      return null;
+    }
+  }
+  function setChainRun(kind) {
+    const s = sessionStore();
+    if (!s) return;
+    try {
+      if (kind === null) s.removeItem(CHAIN_RUN_KEY);
+      else s.setItem(CHAIN_RUN_KEY, kind);
+    } catch {
+    }
+  }
+  var isFinite_ = (n) => typeof n === "number" && Number.isFinite(n);
+  function valid(v) {
+    if (!v || typeof v !== "object") return false;
+    const p = v;
+    if (!isFinite_(p.t)) return false;
+    if (p.kind === "tts") {
+      return isFinite_(p.chunk) && isFinite_(p.total) && isFinite_(p.char) && p.chunk >= 0 && p.total > 0 && p.char >= 0 && typeof p.fp === "string" && (p.sha === null || typeof p.sha === "string");
+    }
+    if (p.kind === "clip") {
+      return isFinite_(p.seconds) && isFinite_(p.duration) && p.seconds >= 0 && p.duration >= 0 && typeof p.file === "string" && typeof p.audioSha === "string";
+    }
+    return false;
+  }
+  function readPositions(now = Date.now()) {
+    let raw = null;
+    try {
+      raw = store()?.getItem(POS_KEY) ?? null;
+    } catch {
+      return {};
+    }
+    if (!raw) return {};
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return {};
+    }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    const out = {};
+    for (const [path, value] of Object.entries(parsed)) {
+      if (!valid(value)) continue;
+      if (now - value.t > MAX_AGE_MS) continue;
+      out[path] = value;
+    }
+    return out;
+  }
+  function persist(map, path, pos) {
+    const s = store();
+    if (!s) return;
+    try {
+      s.setItem(POS_KEY, JSON.stringify(map));
+    } catch {
+      try {
+        s.setItem(POS_KEY, JSON.stringify({ [path]: pos }));
+      } catch {
+      }
+    }
+  }
+  function writePosition(path, pos, now = Date.now()) {
+    const map = readPositions(now);
+    map[path] = { ...pos, t: now };
+    const paths = Object.keys(map);
+    if (paths.length > MAX_ENTRIES) {
+      paths.sort((a, b) => map[a].t - map[b].t).slice(0, paths.length - MAX_ENTRIES).forEach((p) => delete map[p]);
+    }
+    persist(map, path, map[path]);
+  }
+  function clearPosition(path, now = Date.now()) {
+    const map = readPositions(now);
+    if (!(path in map)) return;
+    delete map[path];
+    const s = store();
+    if (!s) return;
+    try {
+      s.setItem(POS_KEY, JSON.stringify(map));
+    } catch {
+    }
+  }
+  function isResumable(pos, page, now = Date.now()) {
+    if (!pos) return false;
+    if (!valid(pos)) return false;
+    if (now - pos.t > MAX_AGE_MS) return false;
+    if (pos.kind !== page.kind) return false;
+    if (pos.kind === "tts" && page.kind === "tts") {
+      if (pos.fp !== page.fp) return false;
+      if (pos.sha && page.sha && pos.sha !== page.sha) return false;
+      if (pos.chunk >= pos.total - 1) return false;
+      return true;
+    }
+    if (pos.kind === "clip" && page.kind === "clip") {
+      if (pos.file !== page.file || pos.audioSha !== page.audioSha) return false;
+      if (pos.duration > 0 && pos.seconds >= pos.duration - END_SECONDS) return false;
+      return true;
+    }
+    return false;
+  }
+  function fractionOf(pos) {
+    if (pos.kind === "tts") {
+      if (!(pos.total > 0)) return 0;
+      return Math.min(1, Math.max(0, pos.chunk / pos.total));
+    }
+    if (!(pos.duration > 0)) return 0;
+    return Math.min(1, Math.max(0, pos.seconds / pos.duration));
+  }
+  function createPositionWriter(write, env = {}) {
+    const now = env.now ?? (() => Date.now());
+    const setTimer = env.setTimer ?? ((fn, ms) => setTimeout(fn, ms));
+    const clearTimer = env.clearTimer ?? ((h) => clearTimeout(h));
+    let lastWrite = -Infinity;
+    let pending = null;
+    let timer = null;
+    const emit = (pos) => {
+      lastWrite = now();
+      pending = null;
+      write(pos);
+    };
+    const fire = () => {
+      timer = null;
+      if (pending) emit(pending);
+    };
+    return {
+      schedule(pos) {
+        const elapsed = now() - lastWrite;
+        if (elapsed >= WRITE_THROTTLE_MS && timer === null) {
+          emit(pos);
+          return;
+        }
+        pending = pos;
+        if (timer === null) timer = setTimer(fire, Math.max(0, WRITE_THROTTLE_MS - elapsed));
+      },
+      flush() {
+        if (timer !== null) {
+          clearTimer(timer);
+          timer = null;
+        }
+        if (pending) emit(pending);
+      },
+      cancel() {
+        if (timer !== null) {
+          clearTimer(timer);
+          timer = null;
+        }
+        pending = null;
+      }
+    };
+  }
+
   // src/sidepanel/read-aloud-player.ts
   var SKIP_SECONDS = 10;
   var KEY_NUDGE_SECONDS = 1;
@@ -223,6 +412,10 @@
   var CLASS_COMING = "glassdocs-ra-coming";
   var CLASS_READ = "glassdocs-ra-read";
   var CLASS_SECTION_ROW = "glassdocs-ra-section";
+  var CLASS_CONTINUE = "glassdocs-ra-continue";
+  var CLASS_NOTICE = "glassdocs-ra-notice";
+  var CONTINUE_LABEL = "Keep playing the next page";
+  var END_OF_KB = "End of this knowledge base";
   function groupSections(items) {
     const out = [];
     for (let i = 0; i < items.length; i++) {
@@ -384,7 +577,24 @@
     });
     readToggle.textContent = "Read \u25B8";
     readToggle.setAttribute("aria-expanded", "false");
-    root.append(barWrap, position, transport, nowWrap, comingWrap, readWrap);
+    const continueWrap = el(doc, "label", CLASS_CONTINUE, "display:flex;gap:.4em;align-items:center;font-size:.78em;cursor:pointer");
+    const continueBox = doc.createElement("input");
+    continueBox.type = "checkbox";
+    continueBox.style.cssText = "margin:0;cursor:pointer";
+    const continueText = doc.createElement("span");
+    continueText.textContent = CONTINUE_LABEL;
+    continueWrap.append(continueBox, continueText);
+    const canContinue = !!host.continueToNextPage;
+    continueWrap.hidden = !canContinue;
+    if (canContinue) {
+      continueBox.checked = host.continueToNextPage.get();
+      continueBox.addEventListener("change", () => {
+        host.continueToNextPage.set(continueBox.checked === true);
+      });
+    }
+    const notice = el(doc, "div", CLASS_NOTICE, "font-size:.78em;opacity:.75");
+    notice.hidden = true;
+    root.append(barWrap, position, transport, notice, nowWrap, comingWrap, readWrap, continueWrap);
     let snap = { state: "idle", items: [], seek: null, progress: null };
     let elapsedMs = 0;
     let playingSince = null;
@@ -560,6 +770,9 @@
     const render = (next) => {
       phase(next.state);
       snap = next;
+      if (canContinue) continueBox.checked = host.continueToNextPage.get();
+      notice.textContent = next.notice ?? "";
+      notice.hidden = !next.notice;
       const hasTimeline = next.seek === "seconds";
       const duration = next.progress?.duration ?? null;
       const previewing = dragging && hasTimeline && duration != null && duration > 0;
@@ -636,10 +849,11 @@
     if (groups.length !== sections.length) return null;
     return groups;
   }
-  function createClipSource(doc, url, timeline) {
+  function createClipSource(doc, url, timeline, startAt = 0) {
     const el2 = doc.createElement("audio");
     el2.preload = "none";
     el2.src = url;
+    let resumeFrom = Number.isFinite(startAt) ? Math.max(0, startAt) : 0;
     const sections = timeline?.sections ?? null;
     const groups = timeline && sections ? alignGroups(timeline.items, sections) : null;
     const items = groups ? timeline.items : NO_ITEMS;
@@ -723,7 +937,8 @@
       label: CLIP_LABEL,
       start() {
         live = true;
-        el2.currentTime = 0;
+        el2.currentTime = resumeFrom;
+        resumeFrom = 0;
         const p = el2.play();
         if (p && typeof p.catch === "function") {
           p.catch((e) => {
@@ -790,6 +1005,89 @@
         progressFns.push(fn);
       }
     };
+  }
+
+  // src/lib/kb-nav.ts
+  var ACTIVE = "md-nav__link--active";
+  function readPrimaryNav(doc, base) {
+    const root = doc.querySelector("nav.md-nav--primary");
+    if (!root) return [];
+    let origin;
+    try {
+      origin = new URL(base).origin;
+    } catch {
+      return [];
+    }
+    const out = [];
+    for (const a of Array.from(root.querySelectorAll("a.md-nav__link"))) {
+      if (a.closest("nav.md-nav--secondary")) continue;
+      const raw = a.getAttribute("href");
+      if (!raw || raw.startsWith("#")) continue;
+      let url;
+      try {
+        url = new URL(raw, base);
+      } catch {
+        continue;
+      }
+      if (url.origin !== origin) continue;
+      out.push({
+        href: url.href,
+        label: (a.textContent ?? "").replace(/\s+/g, " ").trim(),
+        // Trap 2's other half: this element HAS an href, because it came out of an
+        // `a[href]` walk. The <label> twin never reaches here.
+        active: a.classList.contains(ACTIVE)
+      });
+    }
+    return out;
+  }
+  function nextPageHref(doc, base) {
+    const pages = readPrimaryNav(doc, base);
+    if (pages.length === 0) return null;
+    const marked = pages.filter((p) => p.active);
+    if (marked.length !== 1) return null;
+    const at = pages.indexOf(marked[0]);
+    const next = pages[at + 1];
+    if (!next) return null;
+    if (next.href === pages[at].href) return null;
+    return next.href;
+  }
+
+  // src/lib/speech-prefs.ts
+  var DEFAULT_SPEECH_PREFS = { continueToNextPage: false };
+  var PAGE_PREFS_KEY = "glassdocs.readaloud.v1";
+  function clampPrefs(raw) {
+    if (!raw || typeof raw !== "object") return { ...DEFAULT_SPEECH_PREFS };
+    const v = raw.continueToNextPage;
+    return { continueToNextPage: v === true };
+  }
+  function store2() {
+    try {
+      return globalThis.localStorage ?? null;
+    } catch {
+      return null;
+    }
+  }
+  function readPagePrefs() {
+    let raw = null;
+    try {
+      raw = store2()?.getItem(PAGE_PREFS_KEY) ?? null;
+    } catch {
+      return { ...DEFAULT_SPEECH_PREFS };
+    }
+    if (!raw) return { ...DEFAULT_SPEECH_PREFS };
+    try {
+      return clampPrefs(JSON.parse(raw));
+    } catch {
+      return { ...DEFAULT_SPEECH_PREFS };
+    }
+  }
+  function writePagePrefs(prefs) {
+    const s = store2();
+    if (!s) return;
+    try {
+      s.setItem(PAGE_PREFS_KEY, JSON.stringify(clampPrefs(prefs)));
+    } catch {
+    }
   }
 
   // src/sidepanel/read-aloud.ts
@@ -981,7 +1279,7 @@
     if (!synth || !getUtteranceCtor()) return null;
     return pickLocal(await allVoices(synth));
   }
-  function createSpeechSourceWith(blocks, voice) {
+  function createSpeechSourceWith(blocks, voice, startAt) {
     const chunks = toChunks(blocks);
     if (chunks.length === 0) return null;
     const synth = getSynth();
@@ -992,6 +1290,14 @@
     let pauseRequested = false;
     let pausedByCancel = false;
     let utteranceStart = 0;
+    const pendingStart = (() => {
+      if (!startAt) return null;
+      const int = (n) => Number.isFinite(n) ? Math.trunc(n) : 0;
+      const c = Math.min(chunks.length - 1, Math.max(0, int(startAt.chunk)));
+      const room = Math.max(0, chunks[c].text.length - 1);
+      return { chunk: c, char: Math.min(room, Math.max(0, int(startAt.char))) };
+    })();
+    let resumeFrom = pendingStart;
     const endedFns = [];
     const errorFns = [];
     const yieldFns = [];
@@ -1010,16 +1316,16 @@
       };
       for (const fn of [...progressFns]) fn(p);
     };
-    const speakChunk = (i) => {
+    const speakChunk = (i, offset = 0) => {
       if (i >= chunks.length) {
         for (const fn of [...endedFns]) fn();
         return;
       }
       index = i;
-      utteranceStart = 0;
+      utteranceStart = offset;
       const mine = run;
       emitProgress(utteranceStart);
-      const utterance = new Utterance(chunks[i].text);
+      const utterance = new Utterance(offset > 0 ? chunks[i].text.slice(offset) : chunks[i].text);
       utterance.voice = voice;
       utterance.onend = () => {
         if (mine !== run || pauseRequested) return;
@@ -1047,7 +1353,9 @@
         synth.cancel();
         pauseRequested = false;
         pausedByCancel = false;
-        speakChunk(0);
+        const at = resumeFrom;
+        resumeFrom = null;
+        speakChunk(at ? at.chunk : 0, at ? at.char : 0);
       },
       pause() {
         pauseRequested = true;
@@ -1082,6 +1390,8 @@
         pauseRequested = false;
         pausedByCancel = false;
         index = 0;
+        utteranceStart = 0;
+        resumeFrom = null;
         synth.cancel();
       },
       onEnded(fn) {
@@ -1128,10 +1438,12 @@
   // src/page/read-aloud-page.ts
   var PLAY = "\u25B6";
   var PAUSE = "\u23F8";
+  var CHAIN_BLOCKED = "Your browser would not start audio on a page it opened by itself \u2014 press to keep listening";
   var OPEN_PLAYER = "\u25BE";
   var OPEN_PLAYER_TITLE = "Open player";
   var READ_TITLE = "Read this page aloud with a speech voice installed on your device";
   var LISTEN = "Listen";
+  var RESUME = "Resume";
   var AI = "AI";
   var AI_TITLE = "Play the AI-generated narration of this page";
   var LABEL_CLASS = "glassdocs-ra-label";
@@ -1237,9 +1549,10 @@
     bar.id = READ_ALOUD_ID;
     bar.dataset.placement = slot.placement;
     bar.style.cssText = inHeader ? "display:flex;align-items:center;margin:0;position:relative" : "display:flex;gap:0.4em;align-items:center;margin:0 0 1.2em;position:relative";
-    const title = voice ? READ_TITLE : reason ?? READ_TITLE;
+    let title = voice ? READ_TITLE : reason ?? READ_TITLE;
     const playBtn = button(doc, PLAY, title, inHeader ? HEADER_PLAY_STYLE : BUTTON_STYLE);
     const aiBtn = clip ? button(doc, PLAY, AI_TITLE, inHeader ? HEADER_PLAY_STYLE : BUTTON_STYLE) : null;
+    let aiTitle = AI_TITLE;
     const playerBtn = button(doc, OPEN_PLAYER, OPEN_PLAYER_TITLE, inHeader ? HEADER_BUTTON_STYLE : BUTTON_STYLE);
     playerBtn.setAttribute("aria-expanded", "false");
     if (inHeader) {
@@ -1248,7 +1561,8 @@
       playerBtn.className = "md-header__button";
       injectHeaderStyle(doc);
     }
-    playBtn.append(labelSpan(doc, LISTEN, LABEL_CLASS, inHeader));
+    const playLabel = labelSpan(doc, LISTEN, LABEL_CLASS, inHeader);
+    playBtn.append(playLabel);
     if (aiBtn) aiBtn.append(labelSpan(doc, AI, AI_LABEL_CLASS, inHeader));
     playerBtn.hidden = true;
     if (aiBtn) bar.append(playBtn, aiBtn, playerBtn);
@@ -1263,34 +1577,107 @@
     }
     let pending = voice ? "tts" : "clip";
     let active = null;
+    const path = globalThis.location?.pathname ?? "/";
+    const arrivedByChain = readChainRun();
+    setChainRun(null);
+    const sourceSha = readAudioMetaFromDom(doc).pageSha;
+    const identityFor = (which, fp) => {
+      if (which === "tts") return { kind: "tts", fp, sha: sourceSha };
+      if (!clip) return null;
+      return { kind: "clip", file: clip.file, audioSha: clip.audioSha };
+    };
+    const resumeFor = (which, fp) => {
+      if (arrivedByChain) return null;
+      const id = identityFor(which, fp);
+      if (!id) return null;
+      const pos = readPositions()[path];
+      return isResumable(pos, id) ? pos : null;
+    };
+    let spokenFp = "";
+    const writer = createPositionWriter((pos) => writePosition(path, pos));
+    let notice = null;
+    const forget = () => {
+      writer.cancel();
+      clearPosition(path);
+    };
+    const showResume = (pos) => {
+      const where = pos ? `from where you left off (about ${Math.round(fractionOf(pos) * 100)}% in)` : "";
+      const tts = pos?.kind === "tts";
+      playLabel.textContent = tts ? RESUME : LISTEN;
+      title = tts ? `Resume reading ${where}` : voice ? READ_TITLE : reason ?? READ_TITLE;
+      playBtn.title = title;
+      playBtn.setAttribute("aria-label", title);
+      aiTitle = pos?.kind === "clip" ? `Resume the AI narration ${where}` : AI_TITLE;
+      if (aiBtn) {
+        aiBtn.title = aiTitle;
+        aiBtn.setAttribute("aria-label", aiTitle);
+      }
+    };
     const resolve = () => {
       const blocks = readableBlocks(mainContentRoot(doc));
+      const items = toChunks(blocks);
+      spokenFp = fingerprintChunks(items.map((c) => c.text));
       if (pending === "clip") {
         if (!clip) return null;
+        const at2 = resumeFor("clip", spokenFp);
         const source2 = createClipSource(
           doc,
           clip.file,
-          clip.sections ? { sections: clip.sections, items: toChunks(blocks) } : void 0
+          clip.sections ? { sections: clip.sections, items } : void 0,
+          at2 && at2.kind === "clip" ? at2.seconds : 0
         );
         active = "clip";
         postReadAloudSignal(READ_ALOUD_STARTED);
         return source2;
       }
       if (!voice) return null;
-      const source = createSpeechSourceWith(blocks, voice);
+      const at = resumeFor("tts", spokenFp);
+      const source = createSpeechSourceWith(
+        blocks,
+        voice,
+        at && at.kind === "tts" ? { chunk: at.chunk, char: at.char } : void 0
+      );
       if (source) {
         active = "tts";
         postReadAloudSignal(READ_ALOUD_STARTED);
       }
       return source;
     };
-    const transport = createTransport(resolve);
+    let triedClipFallback = false;
+    const transport = createTransport(resolve, (_label, payload) => {
+      const message = String(payload?.message ?? "");
+      if (!/not-?allowed/i.test(message)) return;
+      if (!arrivedByChain) return;
+      if (arrivedByChain === "clip" && voice && !triedClipFallback) {
+        triedClipFallback = true;
+        startWith("tts");
+        return;
+      }
+      title = CHAIN_BLOCKED;
+      playBtn.title = title;
+      playBtn.setAttribute("aria-label", title);
+    });
     const player = createReadAloudPlayer(doc, {
       seekTo: (position) => transport.seekTo(position),
       // A section row's number is an ITEM index; only the source knows what that
       // means in its own unit (#301).
       seekToItem: (index) => transport.seekToItem(index),
-      stop: () => transport.stop()
+      // Auto-advance is a PAGE behaviour and this is the page. The panel leaves
+      // this unset and renders no row — see PlayerHost in read-aloud-player.ts.
+      continueToNextPage: {
+        get: () => readPagePrefs().continueToNextPage,
+        set: (on) => {
+          writePagePrefs({ ...readPagePrefs(), continueToNextPage: on });
+          if (!on) setChainRun(null);
+        }
+      },
+      stop: () => {
+        forget();
+        showResume(null);
+        setChainRun(null);
+        notice = null;
+        transport.stop();
+      }
     });
     const popover = doc.createElement("div");
     popover.className = PLAYER_CLASS;
@@ -1305,7 +1692,8 @@
         items: transport.items(),
         seek: transport.seekUnit(),
         progress,
-        itemPrecise: (index) => transport.itemPrecise(index)
+        itemPrecise: (index) => transport.itemPrecise(index),
+        notice
       });
     };
     const CLAMP_MARGIN = 8;
@@ -1332,8 +1720,33 @@
       snapshot(latest);
       keepOnScreen();
     };
+    const positionFrom = (p) => {
+      if (active === "clip") {
+        if (!clip) return null;
+        return {
+          kind: "clip",
+          seconds: p.seconds ?? 0,
+          duration: p.duration ?? 0,
+          file: clip.file,
+          audioSha: clip.audioSha,
+          t: 0
+        };
+      }
+      if (active !== "tts" || !spokenFp) return null;
+      return {
+        kind: "tts",
+        chunk: p.index,
+        total: p.total,
+        char: p.charIndex ?? 0,
+        fp: spokenFp,
+        sha: sourceSha,
+        t: 0
+      };
+    };
     transport.onProgress((p) => {
       latest = p;
+      const pos = positionFrom(p);
+      if (pos) writer.schedule(pos);
       if (!popover.hidden) snapshot(p);
     });
     playerBtn.addEventListener("click", () => setOpen(popover.hidden));
@@ -1361,10 +1774,37 @@
       btn.title = next;
       btn.setAttribute("aria-label", next);
     };
+    const continueToNext = (kind) => {
+      if (!readPagePrefs().continueToNextPage) return;
+      if (doc.hidden) {
+        setChainRun(null);
+        return;
+      }
+      const here = globalThis.location?.href ?? "";
+      const next = nextPageHref(doc, here);
+      if (!next) {
+        setChainRun(null);
+        notice = END_OF_KB;
+        snapshot(latest);
+        return;
+      }
+      setChainRun(kind);
+      globalThis.location?.assign?.(next);
+    };
     transport.onStateChange((state) => {
+      const wasActive = active;
       if (state === "idle" || state === "ended") active = null;
+      if (state === "ended") {
+        forget();
+        showResume(null);
+      }
+      if (state === "paused") {
+        writer.flush();
+        setChainRun(null);
+      }
+      if (state === "playing") notice = null;
       paint(playBtn, playGlyph, title, "tts", state);
-      if (aiBtn) paint(aiBtn, aiGlyph, AI_TITLE, "clip", state);
+      if (aiBtn) paint(aiBtn, aiGlyph, aiTitle, "clip", state);
       const live = state === "playing" || state === "paused";
       playerBtn.hidden = !live;
       if (!live) {
@@ -1373,6 +1813,7 @@
       } else if (!popover.hidden) {
         snapshot(latest);
       }
+      if (state === "ended") continueToNext(wasActive ?? "tts");
     });
     const startWith = (which) => {
       if (active && active !== which) transport.stop();
@@ -1381,7 +1822,17 @@
     };
     if (voice) playBtn.addEventListener("click", () => startWith("tts"));
     if (aiBtn) aiBtn.addEventListener("click", () => startWith("clip"));
+    globalThis.window?.addEventListener("pagehide", () => writer.flush());
+    doc.addEventListener("visibilitychange", () => {
+      if (doc.visibilityState === "hidden") writer.flush();
+    });
     globalThis.window?.addEventListener("pagehide", () => transport.stop());
+    {
+      const loadFp = fingerprintChunks(toChunks(readableBlocks(root)).map((c) => c.text));
+      const ttsResume = voice ? resumeFor("tts", loadFp) : null;
+      showResume(ttsResume ?? resumeFor("clip", loadFp));
+    }
+    if (arrivedByChain) startWith(arrivedByChain === "clip" && clip ? "clip" : "tts");
     slot.parent.insertBefore(bar, slot.before);
   }
   function resolveClip(doc) {
@@ -1394,7 +1845,7 @@
     if (typeof probe.canPlayType !== "function") return null;
     if (probe.canPlayType(mime) === "") return null;
     const raw = doc.querySelector('meta[name="audio-sections"]')?.getAttribute("content");
-    return { file: verdict.file, sections: parseAudioSections(raw) };
+    return { file: verdict.file, audioSha: meta.audioSha ?? "", sections: parseAudioSections(raw) };
   }
   async function initReadAloudPage(doc = document) {
     const root = mainContentRoot(doc);

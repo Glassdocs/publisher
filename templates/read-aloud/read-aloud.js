@@ -75,14 +75,51 @@
     if (el2.hidden === true) return true;
     return false;
   }
+  var WS = /\s/;
+  function collapse(pieces) {
+    const chars = [];
+    const runs = [];
+    let cur = null;
+    let pending = null;
+    const emit = (ch, node, offset) => {
+      const textStart = chars.length;
+      chars.push(ch);
+      if (!node) {
+        cur = null;
+        return;
+      }
+      if (cur && cur.node === node && cur.nodeStart + cur.length === offset) {
+        cur.length++;
+        return;
+      }
+      cur = { node, nodeStart: offset, textStart, length: 1 };
+      runs.push(cur);
+    };
+    for (const piece of pieces) {
+      for (let i = 0; i < piece.data.length; i++) {
+        const ch = piece.data[i];
+        if (WS.test(ch)) {
+          if (chars.length > 0 && !pending) pending = { node: piece.node, offset: i };
+          continue;
+        }
+        if (pending) {
+          emit(" ", pending.node, pending.offset);
+          pending = null;
+        }
+        emit(ch, piece.node, i);
+      }
+    }
+    return { text: chars.join(""), runs };
+  }
   function flush(ctx) {
-    const text = ctx.buf.join("").replace(/\s+/g, " ").trim();
+    const { text, runs } = collapse(ctx.buf);
     ctx.buf.length = 0;
     if (!text) return;
     const block = { kind: ctx.kind, text };
     if (ctx.kind === "heading" && ctx.level) block.level = ctx.level;
     if (ctx.id) block.id = ctx.id;
     ctx.out.push(block);
+    ctx.runs.push(runs);
   }
   function idOf(el2) {
     const id = el2.id;
@@ -95,7 +132,7 @@
   function walk(node, ctx) {
     for (const child of Array.from(node.childNodes)) {
       if (child.nodeType === NODE_TEXT) {
-        ctx.buf.push(child.nodeValue ?? "");
+        ctx.buf.push({ node: child, data: child.nodeValue ?? "" });
         continue;
       }
       if (child.nodeType !== NODE_ELEMENT) continue;
@@ -114,6 +151,7 @@
           const anchor = idOf(el2) ?? ctx.id;
           if (anchor) block.id = anchor;
           ctx.out.push(block);
+          ctx.runs.push([]);
         }
         continue;
       }
@@ -138,10 +176,11 @@
     }
     return doc.body;
   }
-  function readableBlocks(root = document.body) {
-    if (!root) return [];
+  function readableBlocksWithRanges(root = document.body) {
+    if (!root) return { blocks: [], ranges: [] };
     const ctx = {
       out: [],
+      runs: [],
       buf: [],
       kind: "para",
       id: idOf(root),
@@ -149,7 +188,126 @@
     };
     walk(root, ctx);
     flush(ctx);
-    return ctx.out;
+    return { blocks: ctx.out, ranges: ctx.runs };
+  }
+  function readableBlocks(root = document.body) {
+    return readableBlocksWithRanges(root).blocks;
+  }
+
+  // src/page/word-highlight.ts
+  var HIGHLIGHT_NAME = "glassdocs-read-aloud-word";
+  var HIGHLIGHT_STYLE_ID = "glassdocs-read-aloud-highlight-style";
+  var HIGHLIGHT_CSS = `::highlight(${HIGHLIGHT_NAME}){background-color:rgba(255,213,79,.45);color:inherit}`;
+  var WS2 = /\s/;
+  function locate(runs, offset) {
+    for (const run of runs) {
+      if (offset >= run.textStart && offset < run.textStart + run.length) {
+        return { node: run.node, offset: run.nodeStart + (offset - run.textStart) };
+      }
+    }
+    return null;
+  }
+  function registryOf() {
+    const g = globalThis;
+    const registry = typeof g.CSS !== "undefined" ? g.CSS?.highlights : void 0;
+    const Ctor = g.Highlight;
+    if (!registry || typeof Ctor !== "function") return null;
+    return { registry, Ctor };
+  }
+  function injectHighlightStyle(doc) {
+    const host = doc.head ?? doc.documentElement;
+    if (!host || host.querySelector(`#${HIGHLIGHT_STYLE_ID}`)) return;
+    const style = doc.createElement("style");
+    style.id = HIGHLIGHT_STYLE_ID;
+    style.textContent = HIGHLIGHT_CSS;
+    host.appendChild(style);
+  }
+  function createWordHighlight(doc) {
+    let source = null;
+    let painted = false;
+    const paint = (range) => {
+      const found = registryOf();
+      if (!found) return;
+      if (!range) {
+        if (painted) found.registry.delete(HIGHLIGHT_NAME);
+        painted = false;
+        return;
+      }
+      found.registry.set(HIGHLIGHT_NAME, new found.Ctor(range));
+      painted = true;
+    };
+    const resolve = (index, charIndex) => {
+      if (!source || charIndex == null) return null;
+      const item = source.items[index];
+      if (!item?.origin) return null;
+      const runs = source.ranges[item.origin.block];
+      const block = source.blocks[item.origin.block];
+      if (!runs || !runs.length || !block) return null;
+      let from = Math.trunc(charIndex);
+      if (!(from >= 0) || from >= item.text.length) return null;
+      while (from < item.text.length && WS2.test(item.text[from])) from++;
+      if (from >= item.text.length) return null;
+      let to = from;
+      while (to < item.text.length && !WS2.test(item.text[to])) to++;
+      const start = item.origin.start + from;
+      const end = Math.min(item.origin.start + to, block.text.length);
+      if (start >= end || start >= block.text.length) return null;
+      const head = locate(runs, start);
+      const tail = locate(runs, end - 1);
+      if (!head || !tail) return null;
+      try {
+        const range = doc.createRange();
+        range.setStart(head.node, head.offset);
+        range.setEnd(tail.node, tail.offset + 1);
+        return range;
+      } catch {
+        return null;
+      }
+    };
+    return {
+      setSource(next) {
+        source = next;
+        if (!next) paint(null);
+      },
+      show(index, charIndex) {
+        const range = resolve(index, charIndex);
+        paint(range);
+        return range;
+      },
+      clear() {
+        paint(null);
+      }
+    };
+  }
+  var BAND_TOP = 0.25;
+  var BAND_BOTTOM = 0.75;
+  function createFollowScroller(doc) {
+    let suspended = false;
+    return {
+      follow(range) {
+        if (suspended || !range) return;
+        if (doc.hidden) return;
+        const win = doc.defaultView ?? globalThis.window;
+        if (!win?.scrollBy) return;
+        const rect = range.getBoundingClientRect?.();
+        if (!rect || !rect.height && !rect.width) return;
+        const view = doc.documentElement?.clientHeight || win.innerHeight || 0;
+        if (!view) return;
+        if (rect.top >= view * BAND_TOP && rect.bottom <= view * BAND_BOTTOM) return;
+        const delta = rect.top + rect.height / 2 - view / 2;
+        const reduced = globalThis.matchMedia?.(
+          "(prefers-reduced-motion: reduce)"
+        )?.matches === true;
+        win.scrollBy({ top: delta, left: 0, behavior: reduced ? "auto" : "smooth" });
+      },
+      suspend() {
+        suspended = true;
+      },
+      resume() {
+        suspended = false;
+      },
+      isSuspended: () => suspended
+    };
   }
 
   // src/lib/published-audio.ts
@@ -413,8 +571,14 @@
   var CLASS_READ = "glassdocs-ra-read";
   var CLASS_SECTION_ROW = "glassdocs-ra-section";
   var CLASS_CONTINUE = "glassdocs-ra-continue";
+  var CLASS_AUTOSCROLL = "glassdocs-ra-autoscroll";
   var CLASS_NOTICE = "glassdocs-ra-notice";
+  var CLASS_SOURCE = "glassdocs-ra-source";
+  var CLASS_SWITCH = "glassdocs-ra-switch";
   var CONTINUE_LABEL = "Keep playing the next page";
+  var AUTO_SCROLL_LABEL = "Follow along as it reads";
+  var COMING_HEAD = "Coming up";
+  var SECTIONS_HEAD = "Sections";
   var END_OF_KB = "End of this knowledge base";
   function groupSections(items) {
     const out = [];
@@ -550,14 +714,16 @@
     setLabel(stopBtn, "\u23F9", "Stop reading");
     const prevBtn = controlButton(doc, CLASS_PREV);
     const nextBtn = controlButton(doc, CLASS_NEXT);
-    transport.append(stopBtn, prevBtn, nextBtn);
+    const sourceEl = el(doc, "span", CLASS_SOURCE, "font-size:.8em;opacity:.75");
+    const switchBtn = controlButton(doc, CLASS_SWITCH);
+    transport.append(stopBtn, prevBtn, nextBtn, sourceEl, switchBtn);
     const nowWrap = el(doc, "div", CLASS_NOW, "font-size:.78em");
     const nowHead = el(doc, "div", "glassdocs-ra-head", "opacity:.6;text-transform:uppercase;letter-spacing:.05em;font-size:.9em");
     const nowText = el(doc, "div", "glassdocs-ra-now-text", "margin-top:.15em");
     nowWrap.append(nowHead, nowText);
     const comingWrap = el(doc, "div", CLASS_COMING, "font-size:.78em");
     const comingHead = el(doc, "div", "glassdocs-ra-head", "opacity:.6;text-transform:uppercase;letter-spacing:.05em;font-size:.9em");
-    comingHead.textContent = "Coming up";
+    comingHead.textContent = COMING_HEAD;
     const comingList = el(doc, "div", "glassdocs-ra-coming-list", "display:flex;flex-direction:column;gap:.1em;margin-top:.15em");
     comingWrap.append(comingHead, comingList);
     const readWrap = el(doc, "div", CLASS_READ, "font-size:.78em");
@@ -585,16 +751,31 @@
     continueText.textContent = CONTINUE_LABEL;
     continueWrap.append(continueBox, continueText);
     const canContinue = !!host.continueToNextPage;
-    continueWrap.hidden = !canContinue;
     if (canContinue) {
       continueBox.checked = host.continueToNextPage.get();
       continueBox.addEventListener("change", () => {
         host.continueToNextPage.set(continueBox.checked === true);
       });
     }
+    const scrollWrap = el(doc, "label", CLASS_AUTOSCROLL, "display:flex;gap:.4em;align-items:center;font-size:.78em;cursor:pointer");
+    const scrollBox = doc.createElement("input");
+    scrollBox.type = "checkbox";
+    scrollBox.style.cssText = "margin:0;cursor:pointer";
+    const scrollText = doc.createElement("span");
+    scrollText.textContent = AUTO_SCROLL_LABEL;
+    scrollWrap.append(scrollBox, scrollText);
+    const canAutoScroll = !!host.autoScroll;
+    if (canAutoScroll) {
+      scrollBox.checked = host.autoScroll.get();
+      scrollBox.addEventListener("change", () => {
+        host.autoScroll.set(scrollBox.checked === true);
+      });
+    }
     const notice = el(doc, "div", CLASS_NOTICE, "font-size:.78em;opacity:.75");
     notice.hidden = true;
-    root.append(barWrap, position, transport, notice, nowWrap, comingWrap, readWrap, continueWrap);
+    root.append(barWrap, position, transport, notice, nowWrap, comingWrap, readWrap);
+    if (canContinue) root.append(continueWrap);
+    if (canAutoScroll) root.append(scrollWrap);
     let snap = { state: "idle", items: [], seek: null, progress: null };
     let elapsedMs = 0;
     let playingSince = null;
@@ -722,6 +903,7 @@
       host.seekTo(fractionAt(x, rect) * duration);
     });
     stopBtn.addEventListener("click", () => host.stop());
+    if (host.switchSource) switchBtn.addEventListener("click", () => host.switchSource());
     prevBtn.addEventListener("click", () => {
       if (snap.seek === "seconds") {
         host.seekTo(Math.max(0, (snap.progress?.seconds ?? 0) - SKIP_SECONDS));
@@ -736,7 +918,7 @@
       }
       if (snap.seek === "item") host.seekTo((snap.progress?.index ?? 0) + 1);
     });
-    const sectionRow = (group, clickable) => {
+    const sectionRow = (group, clickable, verb = "Jump to") => {
       const name = group.section?.text ?? "Introduction";
       const count = `${group.count} sentence${group.count === 1 ? "" : "s"}`;
       if (!clickable) {
@@ -759,8 +941,8 @@
       n.style.cssText = "opacity:.6;white-space:nowrap";
       n.textContent = count;
       row.append(label, n);
-      row.title = `Jump to ${name}`;
-      row.setAttribute("aria-label", `Jump to ${name}`);
+      row.title = `${verb} ${name}`;
+      row.setAttribute("aria-label", `${verb} ${name}`);
       row.addEventListener("click", () => {
         if (host.seekToItem) host.seekToItem(group.from);
         else host.seekTo(group.from);
@@ -770,7 +952,9 @@
     const render = (next) => {
       phase(next.state);
       snap = next;
+      const atRest = (next.state === "idle" || next.state === "ended") && next.progress == null;
       if (canContinue) continueBox.checked = host.continueToNextPage.get();
+      if (canAutoScroll) scrollBox.checked = host.autoScroll.get();
       notice.textContent = next.notice ?? "";
       notice.hidden = !next.notice;
       const hasTimeline = next.seek === "seconds";
@@ -796,6 +980,18 @@
       position.textContent = hasTimeline ? line : `${Math.round(fraction * 100)}% \xB7 ${line}`;
       if (hasTimeline) bar.setAttribute("aria-valuetext", line);
       else bar.removeAttribute("aria-valuetext");
+      barWrap.hidden = atRest;
+      position.hidden = atRest;
+      transport.hidden = atRest;
+      transport.style.display = atRest ? "none" : "flex";
+      const live = next.state === "playing" || next.state === "paused";
+      const sourceName = next.sourceLabel ?? "";
+      sourceEl.textContent = sourceName;
+      sourceEl.hidden = !live || !sourceName;
+      const switchWords = next.switchLabel ?? "";
+      const canSwitch = !!host.switchSource && !!switchWords && live;
+      switchBtn.hidden = !canSwitch;
+      if (canSwitch) setLabel(switchBtn, switchWords, switchWords);
       const canSeek = next.seek !== null;
       prevBtn.hidden = !canSeek;
       nextBtn.hidden = !canSeek;
@@ -807,6 +1003,19 @@
         setLabel(nextBtn, "\u23ED Next sentence", "Next sentence");
       }
       const hasQueue = next.items.length > 0;
+      if (atRest) {
+        nowWrap.hidden = true;
+        readWrap.hidden = true;
+        comingWrap.hidden = !hasQueue;
+        comingHead.textContent = SECTIONS_HEAD;
+        comingList.replaceChildren();
+        if (!hasQueue) return;
+        for (const group of groupSections(next.items)) {
+          comingList.append(sectionRow(group, next.idleSeekable === true, "Play from"));
+        }
+        return;
+      }
+      comingHead.textContent = COMING_HEAD;
       nowWrap.hidden = !hasQueue;
       comingWrap.hidden = !hasQueue;
       readWrap.hidden = !hasQueue;
@@ -898,7 +1107,8 @@
       return sections[g].start;
     };
     const seekSeconds = (seconds) => {
-      el2.currentTime = Math.min(el2.duration || 0, Math.max(0, seconds));
+      const want = Math.max(0, seconds);
+      el2.currentTime = Number.isFinite(el2.duration) ? Math.min(el2.duration, want) : want;
       emitProgress();
     };
     const endedFns = [];
@@ -1053,12 +1263,26 @@
   }
 
   // src/lib/speech-prefs.ts
-  var DEFAULT_SPEECH_PREFS = { continueToNextPage: false };
+  var DEFAULT_SPEECH_PREFS = {
+    continueToNextPage: false,
+    preferredSource: "auto",
+    autoScroll: false
+  };
   var PAGE_PREFS_KEY = "glassdocs.readaloud.v1";
   function clampPrefs(raw) {
     if (!raw || typeof raw !== "object") return { ...DEFAULT_SPEECH_PREFS };
-    const v = raw.continueToNextPage;
-    return { continueToNextPage: v === true };
+    const o = raw;
+    return {
+      continueToNextPage: o.continueToNextPage === true,
+      // The SAFE direction here is "auto", not "tts": "auto" is what the reader
+      // gets having chosen nothing, so an unreadable value returns them to the
+      // default rather than to a choice they never made. Only the exact string
+      // "tts" is a choice; `1`, `"TTS"`, null and a missing key are not.
+      preferredSource: o.preferredSource === "tts" ? "tts" : "auto",
+      // Anything non-boolean becomes `false` — the safe direction, because the
+      // unsafe direction is a page that moves itself.
+      autoScroll: o.autoScroll === true
+    };
   }
   function store2() {
     try {
@@ -1185,6 +1409,7 @@
         if (typeof s.seekToItem === "function") s.seekToItem(index);
         else s.seekTo(index);
       },
+      label: () => source?.label ?? "",
       items: () => source?.items ?? [],
       // Absent means yes: a source that says nothing about precision is exact,
       // which is true of the speech engine and of an idle transport with nothing
@@ -1206,34 +1431,54 @@
   function getUtteranceCtor() {
     return globalThis.SpeechSynthesisUtterance ?? null;
   }
+  function trimAt(s, at) {
+    return { text: s.trim(), start: at + (s.length - s.trimStart().length) };
+  }
   function sentences(text) {
     const out = [];
-    for (const part of text.split(new RegExp("(?<=[.!?])\\s+"))) {
-      let rest = part.trim();
-      if (!rest) continue;
-      while (rest.length > MAX_CHUNK) {
-        let cut = rest.lastIndexOf(" ", MAX_CHUNK);
+    for (const part of splitSentences(text)) {
+      let cur = trimAt(part.text, part.start);
+      if (!cur.text) continue;
+      while (cur.text.length > MAX_CHUNK) {
+        let cut = cur.text.lastIndexOf(" ", MAX_CHUNK);
         if (cut <= 0) cut = MAX_CHUNK;
-        out.push(rest.slice(0, cut).trim());
-        rest = rest.slice(cut).trim();
+        out.push(trimAt(cur.text.slice(0, cut), cur.start));
+        cur = trimAt(cur.text.slice(cut), cur.start + cut);
       }
-      if (rest) out.push(rest);
+      if (cur.text) out.push(cur);
     }
+    return out;
+  }
+  function splitSentences(text) {
+    const out = [];
+    let pos = 0;
+    for (const m of text.matchAll(new RegExp("(?<=[.!?])\\s+", "g"))) {
+      out.push({ text: text.slice(pos, m.index), start: pos });
+      pos = (m.index ?? 0) + m[0].length;
+    }
+    out.push({ text: text.slice(pos), start: pos });
     return out;
   }
   function toChunks(blocks) {
     const out = [];
     let section = null;
-    for (const block of blocks) {
+    for (let index = 0; index < blocks.length; index++) {
+      const block = blocks[index];
       if (block.kind === "code") continue;
-      let text = (block.text ?? "").replace(/\s+/g, " ").trim();
+      const raw = block.text ?? "";
+      let text = raw.replace(/\s+/g, " ").trim();
       if (!text) continue;
+      const mapped = text === raw;
       if (block.kind === "heading") {
         section = { text, level: block.level ?? 1 };
         if (block.id) section.id = block.id;
         if (!/[.!?]$/.test(text)) text += ".";
       }
-      for (const piece of sentences(text)) out.push({ text: piece, section });
+      for (const piece of sentences(text)) {
+        const item = { text: piece.text, section };
+        if (mapped && piece.start < raw.length) item.origin = { block: index, start: piece.start };
+        out.push(item);
+      }
     }
     return out;
   }
@@ -1444,10 +1689,21 @@
   var READ_TITLE = "Read this page aloud with a speech voice installed on your device";
   var LISTEN = "Listen";
   var RESUME = "Resume";
-  var AI = "AI";
   var AI_TITLE = "Play the AI-generated narration of this page";
   var LABEL_CLASS = "glassdocs-ra-label";
-  var AI_LABEL_CLASS = "glassdocs-ra-ai-label";
+  var AI_DOT_CLASS = "glassdocs-ra-ai-dot";
+  var AI_DOT_STYLE = [
+    "display:inline-block",
+    "width:.36em",
+    "height:.36em",
+    "border-radius:50%",
+    "background:currentColor",
+    "margin-left:-.1em",
+    "align-self:flex-start",
+    "flex:none"
+  ].join(";");
+  var SWITCH_TO_TTS = "Use your browser's voice";
+  var SWITCH_TO_AI = "Use the AI voice";
   var GLYPH_CLASS = "glassdocs-ra-glyph";
   var BUTTON_STYLE = [
     "font:inherit",
@@ -1549,33 +1805,39 @@
     bar.id = READ_ALOUD_ID;
     bar.dataset.placement = slot.placement;
     bar.style.cssText = inHeader ? "display:flex;align-items:center;margin:0;position:relative" : "display:flex;gap:0.4em;align-items:center;margin:0 0 1.2em;position:relative";
-    let title = voice ? READ_TITLE : reason ?? READ_TITLE;
+    let pending = !clip ? "tts" : !voice ? "clip" : readPagePrefs().preferredSource === "tts" ? "tts" : "clip";
+    const restingTitle = () => pending === "clip" ? AI_TITLE : voice ? READ_TITLE : reason ?? READ_TITLE;
+    let title = restingTitle();
     const playBtn = button(doc, PLAY, title, inHeader ? HEADER_PLAY_STYLE : BUTTON_STYLE);
-    const aiBtn = clip ? button(doc, PLAY, AI_TITLE, inHeader ? HEADER_PLAY_STYLE : BUTTON_STYLE) : null;
-    let aiTitle = AI_TITLE;
     const playerBtn = button(doc, OPEN_PLAYER, OPEN_PLAYER_TITLE, inHeader ? HEADER_BUTTON_STYLE : BUTTON_STYLE);
     playerBtn.setAttribute("aria-expanded", "false");
     if (inHeader) {
       playBtn.className = "md-header__button";
-      if (aiBtn) aiBtn.className = "md-header__button";
       playerBtn.className = "md-header__button";
       injectHeaderStyle(doc);
     }
+    injectHighlightStyle(doc);
+    const wordHighlight = createWordHighlight(doc);
+    const follow = createFollowScroller(doc);
+    let autoScroll = readPagePrefs().autoScroll;
+    if (clip) {
+      const dot = doc.createElement("span");
+      dot.className = AI_DOT_CLASS;
+      dot.style.cssText = AI_DOT_STYLE;
+      dot.setAttribute("aria-hidden", "true");
+      playBtn.append(dot);
+    }
     const playLabel = labelSpan(doc, LISTEN, LABEL_CLASS, inHeader);
     playBtn.append(playLabel);
-    if (aiBtn) aiBtn.append(labelSpan(doc, AI, AI_LABEL_CLASS, inHeader));
     playerBtn.hidden = true;
-    if (aiBtn) bar.append(playBtn, aiBtn, playerBtn);
-    else bar.append(playBtn, playerBtn);
-    if (!voice) {
+    bar.append(playBtn, playerBtn);
+    if (!voice && !clip) {
       playBtn.disabled = true;
       playBtn.style.cssText = inHeader ? HEADER_DISABLED_STYLE : DISABLED_STYLE;
-    }
-    if (!voice && !clip) {
       slot.parent.insertBefore(bar, slot.before);
       return;
     }
-    let pending = voice ? "tts" : "clip";
+    playerBtn.hidden = false;
     let active = null;
     const path = globalThis.location?.pathname ?? "/";
     const arrivedByChain = readChainRun();
@@ -1602,21 +1864,16 @@
     };
     const showResume = (pos) => {
       const where = pos ? `from where you left off (about ${Math.round(fractionOf(pos) * 100)}% in)` : "";
-      const tts = pos?.kind === "tts";
-      playLabel.textContent = tts ? RESUME : LISTEN;
-      title = tts ? `Resume reading ${where}` : voice ? READ_TITLE : reason ?? READ_TITLE;
+      playLabel.textContent = pos ? RESUME : LISTEN;
+      title = !pos ? restingTitle() : pos.kind === "clip" ? `Resume the AI narration ${where}` : `Resume reading ${where}`;
       playBtn.title = title;
       playBtn.setAttribute("aria-label", title);
-      aiTitle = pos?.kind === "clip" ? `Resume the AI narration ${where}` : AI_TITLE;
-      if (aiBtn) {
-        aiBtn.title = aiTitle;
-        aiBtn.setAttribute("aria-label", aiTitle);
-      }
     };
     const resolve = () => {
-      const blocks = readableBlocks(mainContentRoot(doc));
+      const { blocks, ranges } = readableBlocksWithRanges(mainContentRoot(doc));
       const items = toChunks(blocks);
       spokenFp = fingerprintChunks(items.map((c) => c.text));
+      wordHighlight.setSource({ blocks, ranges, items });
       if (pending === "clip") {
         if (!clip) return null;
         const at2 = resumeFor("clip", spokenFp);
@@ -1627,6 +1884,7 @@
           at2 && at2.kind === "clip" ? at2.seconds : 0
         );
         active = "clip";
+        wordHighlight.clear();
         postReadAloudSignal(READ_ALOUD_STARTED);
         return source2;
       }
@@ -1661,7 +1919,12 @@
       seekTo: (position) => transport.seekTo(position),
       // A section row's number is an ITEM index; only the source knows what that
       // means in its own unit (#301).
-      seekToItem: (index) => transport.seekToItem(index),
+      seekToItem: (index) => {
+        const state = transport.state();
+        if (state === "idle" || state === "ended") startWith(pending);
+        transport.seekToItem(index);
+        follow.resume();
+      },
       // Auto-advance is a PAGE behaviour and this is the page. The panel leaves
       // this unset and renders no row — see PlayerHost in read-aloud-player.ts.
       continueToNextPage: {
@@ -1671,9 +1934,27 @@
           if (!on) setChainRun(null);
         }
       },
+      // Follow the voice with the viewport (#343). A PAGE behaviour: the panel has
+      // no page to scroll — the article is in another document — so it leaves this
+      // unset and renders no row.
+      autoScroll: {
+        get: () => readPagePrefs().autoScroll,
+        set: (on) => {
+          writePagePrefs({ ...readPagePrefs(), autoScroll: on });
+          autoScroll = on;
+        }
+      },
+      // Two engines, one press to change which is reading (#344 §5.4). The panel
+      // leaves this unset and gets no control at all — it has one engine.
+      switchSource: () => {
+        const other = active === "clip" ? "tts" : "clip";
+        writePagePrefs({ ...readPagePrefs(), preferredSource: other === "tts" ? "tts" : "auto" });
+        startWith(other);
+      },
       stop: () => {
         forget();
         showResume(null);
+        follow.resume();
         setChainRun(null);
         notice = null;
         transport.stop();
@@ -1686,14 +1967,35 @@
     popover.hidden = true;
     popover.append(player.el);
     bar.append(popover);
+    const pageSections = () => toChunks(readableBlocks(mainContentRoot(doc)));
+    const idleSeekable = () => pending === "tts" ? voice != null : clip?.sections != null;
+    const switchWords = () => {
+      if (!clip || !voice) return null;
+      return active === "clip" ? SWITCH_TO_TTS : SWITCH_TO_AI;
+    };
     const snapshot = (progress) => {
+      const state = transport.state();
+      const atRest = state === "idle" || state === "ended";
       player.render({
-        state: transport.state(),
-        items: transport.items(),
+        state,
+        items: atRest ? pageSections() : transport.items(),
         seek: transport.seekUnit(),
         progress,
         itemPrecise: (index) => transport.itemPrecise(index),
-        notice
+        idleSeekable: idleSeekable(),
+        notice,
+        // The engine that is actually speaking, in the SOURCE's own words (#344
+        // §5.3). Forwarded from the transport, not composed here — the strings are
+        // clip-source's CLIP_LABEL and speech-source's "Read aloud", the same two
+        // the side panel has shown beside its transport since #186.
+        //
+        // This is the mitigation the merge rests on. With AI preferred by default
+        // and #304 open, a reader on a page with a table gets less narration than
+        // the browser voice would read them; the readout is what makes that
+        // discoverable rather than invisible, and the switch beside it is the one
+        // press that fixes it. Removing either reopens #344.
+        sourceLabel: transport.label(),
+        switchLabel: switchWords()
       });
     };
     const CLAMP_MARGIN = 8;
@@ -1745,6 +2047,10 @@
     };
     transport.onProgress((p) => {
       latest = p;
+      if (active === "tts") {
+        const range = wordHighlight.show(p.index, p.charIndex);
+        if (autoScroll) follow.follow(range);
+      } else wordHighlight.clear();
       const pos = positionFrom(p);
       if (pos) writer.schedule(pos);
       if (!popover.hidden) snapshot(p);
@@ -1756,8 +2062,13 @@
     });
     doc.addEventListener("click", (event) => {
       if (popover.hidden) return;
-      const target = event.target;
-      if (target && bar.contains(target)) return;
+      const path2 = event.composedPath?.();
+      if (path2) {
+        if (path2.includes(bar)) return;
+      } else {
+        const target = event.target;
+        if (target && bar.contains(target)) return;
+      }
       setOpen(false);
     });
     globalThis.window?.addEventListener("message", (event) => {
@@ -1765,14 +2076,13 @@
       transport.stop();
     });
     const playGlyph = playBtn.querySelector(`.${GLYPH_CLASS}`);
-    const aiGlyph = aiBtn ? aiBtn.querySelector(`.${GLYPH_CLASS}`) : null;
-    const paint = (btn, glyphEl, resting, mine, state) => {
-      const isActive = active === mine;
-      const playing = isActive && state === "playing";
-      if (glyphEl) glyphEl.textContent = playing ? PAUSE : PLAY;
-      const next = playing ? "Pause reading" : isActive && state === "paused" ? "Resume reading" : resting;
-      btn.title = next;
-      btn.setAttribute("aria-label", next);
+    const paint = (state) => {
+      const live = active !== null;
+      const playing = live && state === "playing";
+      if (playGlyph) playGlyph.textContent = playing ? PAUSE : PLAY;
+      const next = playing ? "Pause reading" : live && state === "paused" ? "Resume reading" : title;
+      playBtn.title = next;
+      playBtn.setAttribute("aria-label", next);
     };
     const continueToNext = (kind) => {
       if (!readPagePrefs().continueToNextPage) return;
@@ -1803,34 +2113,46 @@
         setChainRun(null);
       }
       if (state === "playing") notice = null;
-      paint(playBtn, playGlyph, title, "tts", state);
-      if (aiBtn) paint(aiBtn, aiGlyph, aiTitle, "clip", state);
+      if (state === "idle" || state === "ended") wordHighlight.setSource(null);
+      paint(state);
       const live = state === "playing" || state === "paused";
-      playerBtn.hidden = !live;
-      if (!live) {
-        latest = null;
-        setOpen(false);
-      } else if (!popover.hidden) {
-        snapshot(latest);
-      }
+      if (!live) latest = null;
+      if (!popover.hidden) snapshot(latest);
       if (state === "ended") continueToNext(wasActive ?? "tts");
     });
     const startWith = (which) => {
       if (active && active !== which) transport.stop();
       pending = which;
+      follow.resume();
       void transport.toggle();
     };
-    if (voice) playBtn.addEventListener("click", () => startWith("tts"));
-    if (aiBtn) aiBtn.addEventListener("click", () => startWith("clip"));
+    playBtn.addEventListener("click", () => startWith(pending));
+    const SCROLL_KEYS = /* @__PURE__ */ new Set(["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " "]);
+    const ownsTheKey = (target) => {
+      const el2 = target;
+      if (!el2?.tagName) return false;
+      if (el2.isContentEditable === true) return true;
+      return ["INPUT", "TEXTAREA", "SELECT", "BUTTON", "OPTION"].includes(el2.tagName);
+    };
+    const readerMoved = () => follow.suspend();
+    doc.addEventListener("wheel", readerMoved, { passive: true });
+    doc.addEventListener("touchmove", readerMoved, { passive: true });
+    doc.addEventListener("keydown", (event) => {
+      if (!SCROLL_KEYS.has(event.key)) return;
+      if (ownsTheKey(event.target)) return;
+      readerMoved();
+    });
     globalThis.window?.addEventListener("pagehide", () => writer.flush());
     doc.addEventListener("visibilitychange", () => {
       if (doc.visibilityState === "hidden") writer.flush();
     });
-    globalThis.window?.addEventListener("pagehide", () => transport.stop());
+    globalThis.window?.addEventListener("pagehide", () => {
+      transport.stop();
+      wordHighlight.setSource(null);
+    });
     {
       const loadFp = fingerprintChunks(toChunks(readableBlocks(root)).map((c) => c.text));
-      const ttsResume = voice ? resumeFor("tts", loadFp) : null;
-      showResume(ttsResume ?? resumeFor("clip", loadFp));
+      showResume(resumeFor(pending, loadFp));
     }
     if (arrivedByChain) startWith(arrivedByChain === "clip" && clip ? "clip" : "tts");
     slot.parent.insertBefore(bar, slot.before);

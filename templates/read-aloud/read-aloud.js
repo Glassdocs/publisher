@@ -973,8 +973,17 @@
       bar.style.cursor = hasTimeline ? dragging ? "grabbing" : "grab" : "default";
       thumb.hidden = !hasTimeline;
       thumb.style.left = `${Math.round(fraction * 1e3) / 10}%`;
+      const previewSeconds = previewing ? dragFraction * duration : 0;
+      const previewIndex = previewing && next.itemAt ? next.itemAt(previewSeconds) : null;
       const line = positionLine(
-        previewing ? { ...next, progress: { ...next.progress, seconds: dragFraction * duration } } : next,
+        previewing ? {
+          ...next,
+          progress: {
+            ...next.progress,
+            seconds: previewSeconds,
+            ...previewIndex != null ? { index: previewIndex } : {}
+          }
+        } : next,
         elapsedPlaying()
       );
       position.textContent = hasTimeline ? line : `${Math.round(fraction * 100)}% \xB7 ${line}`;
@@ -1208,6 +1217,19 @@
         const g = groupIndexOf(groups, index);
         return g < 0 ? false : trusted[g] === true;
       },
+      // The SAME function that produces the index this source reports while
+      // playing (see emitProgress above), now answerable over a hypothetical time
+      // — which is all a drag preview needs (#308). Deliberately not a second
+      // implementation in the player: a re-derived character weighting could
+      // disagree with emitProgress about where the playhead is, and the player and
+      // the source disagreeing about position is the drift read-aloud-player.ts's
+      // header exists to prevent.
+      //
+      // With no map it returns 0, which is the pre-#300 clip. That is not a
+      // fabricated position reaching a reader: such a clip has `items: NO_ITEMS`,
+      // and positionLine returns on the empty-queue branch before it reads any
+      // index at all.
+      itemAt,
       seekTo(seconds) {
         seekSeconds(seconds);
       },
@@ -1414,7 +1436,10 @@
       // Absent means yes: a source that says nothing about precision is exact,
       // which is true of the speech engine and of an idle transport with nothing
       // to be imprecise about.
-      itemPrecise: (index) => source?.itemPrecise?.(index) ?? true
+      itemPrecise: (index) => source?.itemPrecise?.(index) ?? true,
+      // Absent means NO ANSWER — see the interface. Still engine-blind: the
+      // seconds go through uninterpreted and the source's own number comes back.
+      itemAt: (seconds) => source?.itemAt?.(seconds) ?? null
     };
   }
 
@@ -1982,6 +2007,11 @@
         seek: transport.seekUnit(),
         progress,
         itemPrecise: (index) => transport.itemPrecise(index),
+        // What the drag preview asks while the thumb is down (#308). Forwarded,
+        // never interpreted: this file knows no more about the clip's section map
+        // than it does about its precision, and null means the current source has
+        // no answer rather than "item 0".
+        itemAt: (seconds) => transport.itemAt(seconds),
         idleSeekable: idleSeekable(),
         notice,
         // The engine that is actually speaking, in the SOURCE's own words (#344

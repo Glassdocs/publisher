@@ -553,6 +553,80 @@
     };
   }
 
+  // src/lib/speech-prefs.ts
+  var RATE_MIN = 0.5;
+  var RATE_MAX = 2;
+  var RATE_STEP = 0.1;
+  var RATE_DEFAULT = 1;
+  var DEFAULT_PLAYBACK_PREFS = {
+    rate: RATE_DEFAULT,
+    voiceURI: null
+  };
+  var DEFAULT_SPEECH_PREFS = {
+    ...DEFAULT_PLAYBACK_PREFS,
+    continueToNextPage: false,
+    preferredSource: "auto",
+    autoScroll: false
+  };
+  var PAGE_PREFS_KEY = "glassdocs.readaloud.v1";
+  function clampRate(raw) {
+    if (typeof raw !== "number" || !Number.isFinite(raw)) return RATE_DEFAULT;
+    return Math.min(RATE_MAX, Math.max(RATE_MIN, raw));
+  }
+  function clampVoiceURI(raw) {
+    return typeof raw === "string" && raw !== "" ? raw : null;
+  }
+  function clampPlaybackPrefs(raw) {
+    if (!raw || typeof raw !== "object") return { ...DEFAULT_PLAYBACK_PREFS };
+    const o = raw;
+    return { rate: clampRate(o.rate), voiceURI: clampVoiceURI(o.voiceURI) };
+  }
+  function clampPrefs(raw) {
+    if (!raw || typeof raw !== "object") return { ...DEFAULT_SPEECH_PREFS };
+    const o = raw;
+    return {
+      ...clampPlaybackPrefs(o),
+      continueToNextPage: o.continueToNextPage === true,
+      // The SAFE direction here is "auto", not "tts": "auto" is what the reader
+      // gets having chosen nothing, so an unreadable value returns them to the
+      // default rather than to a choice they never made. Only the exact string
+      // "tts" is a choice; `1`, `"TTS"`, null and a missing key are not.
+      preferredSource: o.preferredSource === "tts" ? "tts" : "auto",
+      // Anything non-boolean becomes `false` — the safe direction, because the
+      // unsafe direction is a page that moves itself.
+      autoScroll: o.autoScroll === true
+    };
+  }
+  function store2() {
+    try {
+      return globalThis.localStorage ?? null;
+    } catch {
+      return null;
+    }
+  }
+  function readPagePrefs() {
+    let raw = null;
+    try {
+      raw = store2()?.getItem(PAGE_PREFS_KEY) ?? null;
+    } catch {
+      return { ...DEFAULT_SPEECH_PREFS };
+    }
+    if (!raw) return { ...DEFAULT_SPEECH_PREFS };
+    try {
+      return clampPrefs(JSON.parse(raw));
+    } catch {
+      return { ...DEFAULT_SPEECH_PREFS };
+    }
+  }
+  function writePagePrefs(prefs) {
+    const s = store2();
+    if (!s) return;
+    try {
+      s.setItem(PAGE_PREFS_KEY, JSON.stringify(clampPrefs(prefs)));
+    } catch {
+    }
+  }
+
   // src/sidepanel/read-aloud-player.ts
   var SKIP_SECONDS = 10;
   var KEY_NUDGE_SECONDS = 1;
@@ -570,6 +644,8 @@
   var CLASS_COMING = "glassdocs-ra-coming";
   var CLASS_READ = "glassdocs-ra-read";
   var CLASS_SECTION_ROW = "glassdocs-ra-section";
+  var CLASS_RATE = "glassdocs-ra-rate";
+  var CLASS_VOICE = "glassdocs-ra-voice";
   var CLASS_CONTINUE = "glassdocs-ra-continue";
   var CLASS_AUTOSCROLL = "glassdocs-ra-autoscroll";
   var CLASS_NOTICE = "glassdocs-ra-notice";
@@ -577,6 +653,11 @@
   var CLASS_SWITCH = "glassdocs-ra-switch";
   var CONTINUE_LABEL = "Keep playing the next page";
   var AUTO_SCROLL_LABEL = "Follow along as it reads";
+  var RATE_LABEL = "Speed";
+  var VOICE_LABEL = "Voice";
+  var VOICE_AUTO_LABEL = "Automatic";
+  var CLIP_PREFS_REASON = "The AI voice plays at its own recorded speed and voice";
+  var VOICE_NEXT_PLAY_HINT = "Takes effect the next time you press play";
   var COMING_HEAD = "Coming up";
   var SECTIONS_HEAD = "Sections";
   var END_OF_KB = "End of this knowledge base";
@@ -743,6 +824,40 @@
     });
     readToggle.textContent = "Read \u25B8";
     readToggle.setAttribute("aria-expanded", "false");
+    const rateWrap = el(doc, "label", CLASS_RATE, "display:flex;gap:.4em;align-items:center;font-size:.78em");
+    const rateText = doc.createElement("span");
+    rateText.textContent = RATE_LABEL;
+    const rateInput = doc.createElement("input");
+    rateInput.type = "range";
+    rateInput.min = String(RATE_MIN);
+    rateInput.max = String(RATE_MAX);
+    rateInput.step = String(RATE_STEP);
+    rateInput.style.cssText = "flex:1;min-width:5em;margin:0;cursor:pointer";
+    const rateValue = doc.createElement("span");
+    rateValue.style.cssText = "min-width:2.4em;text-align:right;font-variant-numeric:tabular-nums;opacity:.85";
+    rateWrap.append(rateText, rateInput, rateValue);
+    const rateReadout = (r) => `${r.toFixed(1)}\xD7`;
+    const canRate = !!host.rate;
+    if (canRate) {
+      rateInput.addEventListener("input", () => {
+        const next = clampRate(Number(rateInput.value));
+        rateValue.textContent = rateReadout(next);
+        host.rate.set(next);
+      });
+    }
+    const voiceWrap = el(doc, "label", CLASS_VOICE, "display:flex;gap:.4em;align-items:center;font-size:.78em");
+    const voiceText = doc.createElement("span");
+    voiceText.textContent = VOICE_LABEL;
+    const voiceSelect = doc.createElement("select");
+    voiceSelect.style.cssText = "flex:1;min-width:0;font:inherit;font-size:1em;color:inherit;background:transparent;cursor:pointer";
+    voiceWrap.append(voiceText, voiceSelect);
+    const canVoice = !!host.voice;
+    let voiceKeys = [];
+    if (canVoice) {
+      voiceSelect.addEventListener("change", () => {
+        host.voice.set(voiceSelect.value === "" ? null : voiceSelect.value);
+      });
+    }
     const continueWrap = el(doc, "label", CLASS_CONTINUE, "display:flex;gap:.4em;align-items:center;font-size:.78em;cursor:pointer");
     const continueBox = doc.createElement("input");
     continueBox.type = "checkbox";
@@ -774,6 +889,8 @@
     const notice = el(doc, "div", CLASS_NOTICE, "font-size:.78em;opacity:.75");
     notice.hidden = true;
     root.append(barWrap, position, transport, notice, nowWrap, comingWrap, readWrap);
+    if (canRate) root.append(rateWrap);
+    if (canVoice) root.append(voiceWrap);
     if (canContinue) root.append(continueWrap);
     if (canAutoScroll) root.append(scrollWrap);
     let snap = { state: "idle", items: [], seek: null, progress: null };
@@ -955,6 +1072,42 @@
       const atRest = (next.state === "idle" || next.state === "ended") && next.progress == null;
       if (canContinue) continueBox.checked = host.continueToNextPage.get();
       if (canAutoScroll) scrollBox.checked = host.autoScroll.get();
+      const prefsLive = next.ttsRunning !== false;
+      if (canRate) {
+        const r = clampRate(host.rate.get());
+        if (rateInput.value !== String(r)) rateInput.value = String(r);
+        rateValue.textContent = rateReadout(r);
+        rateInput.disabled = !prefsLive;
+        rateWrap.title = prefsLive ? "" : CLIP_PREFS_REASON;
+        rateWrap.style.opacity = prefsLive ? "" : ".55";
+        rateWrap.style.cursor = prefsLive ? "pointer" : "not-allowed";
+      }
+      if (canVoice) {
+        const list = host.voice.list();
+        const chosen = host.voice.get();
+        const keys = ["", ...list.map((v) => v.voiceURI)];
+        if (keys.length !== voiceKeys.length || keys.some((k, i) => k !== voiceKeys[i])) {
+          voiceKeys = keys;
+          voiceSelect.replaceChildren();
+          const auto = doc.createElement("option");
+          auto.value = "";
+          auto.textContent = VOICE_AUTO_LABEL;
+          voiceSelect.append(auto);
+          for (const v of list) {
+            const opt = doc.createElement("option");
+            opt.value = v.voiceURI;
+            opt.textContent = v.lang ? `${v.name} (${v.lang})` : v.name;
+            voiceSelect.append(opt);
+          }
+        }
+        const installed = chosen != null && list.some((v) => v.voiceURI === chosen);
+        const want = installed ? chosen : "";
+        if (voiceSelect.value !== want) voiceSelect.value = want;
+        voiceSelect.disabled = !prefsLive;
+        voiceWrap.title = prefsLive ? next.state === "playing" || next.state === "paused" ? VOICE_NEXT_PLAY_HINT : "" : CLIP_PREFS_REASON;
+        voiceWrap.style.opacity = prefsLive ? "" : ".55";
+        voiceWrap.style.cursor = prefsLive ? "pointer" : "not-allowed";
+      }
       notice.textContent = next.notice ?? "";
       notice.hidden = !next.notice;
       const hasTimeline = next.seek === "seconds";
@@ -1284,58 +1437,6 @@
     return next.href;
   }
 
-  // src/lib/speech-prefs.ts
-  var DEFAULT_SPEECH_PREFS = {
-    continueToNextPage: false,
-    preferredSource: "auto",
-    autoScroll: false
-  };
-  var PAGE_PREFS_KEY = "glassdocs.readaloud.v1";
-  function clampPrefs(raw) {
-    if (!raw || typeof raw !== "object") return { ...DEFAULT_SPEECH_PREFS };
-    const o = raw;
-    return {
-      continueToNextPage: o.continueToNextPage === true,
-      // The SAFE direction here is "auto", not "tts": "auto" is what the reader
-      // gets having chosen nothing, so an unreadable value returns them to the
-      // default rather than to a choice they never made. Only the exact string
-      // "tts" is a choice; `1`, `"TTS"`, null and a missing key are not.
-      preferredSource: o.preferredSource === "tts" ? "tts" : "auto",
-      // Anything non-boolean becomes `false` — the safe direction, because the
-      // unsafe direction is a page that moves itself.
-      autoScroll: o.autoScroll === true
-    };
-  }
-  function store2() {
-    try {
-      return globalThis.localStorage ?? null;
-    } catch {
-      return null;
-    }
-  }
-  function readPagePrefs() {
-    let raw = null;
-    try {
-      raw = store2()?.getItem(PAGE_PREFS_KEY) ?? null;
-    } catch {
-      return { ...DEFAULT_SPEECH_PREFS };
-    }
-    if (!raw) return { ...DEFAULT_SPEECH_PREFS };
-    try {
-      return clampPrefs(JSON.parse(raw));
-    } catch {
-      return { ...DEFAULT_SPEECH_PREFS };
-    }
-  }
-  function writePagePrefs(prefs) {
-    const s = store2();
-    if (!s) return;
-    try {
-      s.setItem(PAGE_PREFS_KEY, JSON.stringify(clampPrefs(prefs)));
-    } catch {
-    }
-  }
-
   // src/sidepanel/read-aloud.ts
   var isThenable = (v) => typeof v?.then === "function";
   function createTransport(resolve, onDiagnostic) {
@@ -1535,21 +1636,28 @@
   function baseTag(lang) {
     return String(lang ?? "").split(/[-_]/)[0].toLowerCase();
   }
-  function pickLocal(voices) {
+  function pickLocal(voices, preferredURI = null) {
     const local = voices.filter((v) => v.localService === true);
     if (local.length === 0) return null;
+    if (preferredURI) {
+      const chosen = local.find((v) => v.voiceURI === preferredURI);
+      if (chosen) return chosen;
+    }
     const preferred = local.find((v) => v.default === true);
     if (preferred) return preferred;
     const want = baseTag(globalThis.navigator?.language ?? "");
     const matched = want ? local.find((v) => baseTag(v.lang) === want) : void 0;
     return matched ?? local[0];
   }
-  async function resolveLocalVoice() {
+  var NO_VOICES = { list: [], choose: () => null };
+  async function resolveVoiceChoices() {
     const synth = getSynth();
-    if (!synth || !getUtteranceCtor()) return null;
-    return pickLocal(await allVoices(synth));
+    if (!synth || !getUtteranceCtor()) return NO_VOICES;
+    const voices = await allVoices(synth);
+    const list = voices.filter((v) => v.localService === true).map((v) => ({ voiceURI: v.voiceURI, name: v.name, lang: v.lang }));
+    return { list, choose: (preferredURI) => pickLocal(voices, preferredURI) };
   }
-  function createSpeechSourceWith(blocks, voice, startAt) {
+  function createSpeechSourceWith(blocks, voice, startAt, getRate = () => DEFAULT_PLAYBACK_PREFS.rate) {
     const chunks = toChunks(blocks);
     if (chunks.length === 0) return null;
     const synth = getSynth();
@@ -1597,6 +1705,7 @@
       emitProgress(utteranceStart);
       const utterance = new Utterance(offset > 0 ? chunks[i].text.slice(offset) : chunks[i].text);
       utterance.voice = voice;
+      utterance.rate = clampRate(getRate());
       utterance.onend = () => {
         if (mine !== run || pauseRequested) return;
         speakChunk(i + 1);
@@ -1823,7 +1932,8 @@
     style.textContent = HEADER_CSS;
     host.appendChild(style);
   }
-  function mount(doc, root, voice, reason, clip) {
+  function mount(doc, root, initialVoice, reason, clip, voices) {
+    let voice = initialVoice;
     const slot = resolveSlot(doc, root);
     const inHeader = slot.placement === "header";
     const bar = doc.createElement("div");
@@ -1918,7 +2028,12 @@
       const source = createSpeechSourceWith(
         blocks,
         voice,
-        at && at.kind === "tts" ? { chunk: at.chunk, char: at.char } : void 0
+        at && at.kind === "tts" ? { chunk: at.chunk, char: at.char } : void 0,
+        // A GETTER over localStorage, re-read per chunk (#212). This one argument
+        // is the whole wiring between the player's speed row and the running
+        // narration: the row writes the preference, the next utterance reads it,
+        // and nothing has to be told that anything changed.
+        () => readPagePrefs().rate
       );
       if (source) {
         active = "tts";
@@ -1949,6 +2064,33 @@
         if (state === "idle" || state === "ended") startWith(pending);
         transport.seekToItem(index);
         follow.resume();
+      },
+      // ── speed and voice (#212) ──
+      //
+      // Supplied by the PAGE and by nothing else. The side panel leaves both unset
+      // and renders neither row: its settings surface is the "Read aloud" fieldset
+      // on the options page, backed by the extension's own settings store, and the
+      // two stores never meet. That is the founder's 2026-08-14 answer expressed structurally —
+      // there is no code path here by which one surface's choice reaches the other.
+      rate: {
+        get: () => readPagePrefs().rate,
+        // No re-render, no restart, nothing told to the running source. It re-reads
+        // this on the next chunk (MAX_CHUNK is 200 characters), so a drag is
+        // audible within about a sentence.
+        set: (rate) => {
+          writePagePrefs({ ...readPagePrefs(), rate });
+        }
+      },
+      voice: {
+        get: () => readPagePrefs().voiceURI,
+        set: (voiceURI) => {
+          writePagePrefs({ ...readPagePrefs(), voiceURI });
+          if (voices) voice = voices.choose(voiceURI) ?? voice;
+        },
+        // ON-DEVICE VOICES ONLY, and that is guaranteed one layer down rather than
+        // here: resolveVoiceChoices() filters on localService before it builds the
+        // list, so a remote voice cannot be offered however this is called.
+        list: () => voices?.list ?? []
       },
       // Auto-advance is a PAGE behaviour and this is the page. The panel leaves
       // this unset and renders no row — see PlayerHost in read-aloud-player.ts.
@@ -2025,7 +2167,12 @@
         // discoverable rather than invisible, and the switch beside it is the one
         // press that fixes it. Removing either reopens #344.
         sourceLabel: transport.label(),
-        switchLabel: switchWords()
+        switchLabel: switchWords(),
+        // Do the speed and voice rows govern what is PLAYING? (#212) The AI clip
+        // is a recorded file: its voice was baked in at generation time and its
+        // speed is not wired to these preferences, so while it plays both rows are
+        // disabled carrying a reason rather than left live and inert.
+        ttsRunning: active !== "clip"
       });
     };
     const CLAMP_MARGIN = 8;
@@ -2204,15 +2351,16 @@
     if (!root) return false;
     const clip = resolveClip(doc);
     if (toChunks(readableBlocks(root)).length === 0) {
-      mount(doc, root, null, NOTHING_TO_READ, clip);
+      mount(doc, root, null, NOTHING_TO_READ, clip, null);
       return true;
     }
-    const voice = await resolveLocalVoice();
+    const voices = await resolveVoiceChoices();
+    const voice = voices.choose(readPagePrefs().voiceURI);
     if (!voice) {
-      mount(doc, root, null, NO_LOCAL_VOICE, clip);
+      mount(doc, root, null, NO_LOCAL_VOICE, clip, voices);
       return true;
     }
-    mount(doc, root, voice, null, clip);
+    mount(doc, root, voice, null, clip, voices);
     return true;
   }
   if (typeof document !== "undefined") {

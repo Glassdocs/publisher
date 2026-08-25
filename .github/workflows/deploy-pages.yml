@@ -752,6 +752,27 @@ jobs:
             --release "$release" \
             --audio-manifest "$SITE_DIR/audio/manifest.json" \
             --site "$SITE_DIR" --docs-dir "$DOCS_DIR"
+          # The manifest is build-time INPUT, not site content (#289). The
+          # injector above is its only reader anywhere — nothing fetches it at
+          # runtime; the in-page player and the extension both resolve a clip
+          # from the page's own <meta> tags, and each records that choice
+          # deliberately. So it leaves the site root here rather than being
+          # served, world-readable, by every KB that declares `public: true`.
+          # The clips stay: they are what the reader plays.
+          #
+          # AFTER the node call, never instead of the `cp` that put it here.
+          # Withholding it from that copy hands the injector a path that does
+          # not exist, which loadAudioManifest() reads as "no audio anywhere"
+          # SILENTLY — no audio-file, no audio-sha, no audio-sections, so no ▶
+          # on any page of any KB, behind a green deploy. That is the #97
+          # failure 2374114 reordered these two steps to fix. Measured, not
+          # inferred: with the manifest excluded from the copy the chain still
+          # exits 0 and prints `source-sha on 3; audio on 0`.
+          #
+          # `rm -f`: a KB with no audio has no $SITE_DIR/audio at all, and the
+          # step runs under `set -uo pipefail`, so a missing path must not fail
+          # a documentation deploy.
+          rm -f "$SITE_DIR/audio/manifest.json"
 
       # _headers (security headers + CSP) is a Cloudflare Pages control file and
       # must sit at the site root. It ALWAYS comes from the platform template —

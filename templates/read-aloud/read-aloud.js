@@ -656,7 +656,7 @@
   var RATE_LABEL = "Speed";
   var VOICE_LABEL = "Voice";
   var VOICE_AUTO_LABEL = "Automatic";
-  var CLIP_PREFS_REASON = "The AI voice plays at its own recorded speed and voice";
+  var CLIP_VOICE_REASON = "The AI voice is a recording \u2014 its voice cannot be changed";
   var VOICE_NEXT_PLAY_HINT = "Takes effect the next time you press play";
   var COMING_HEAD = "Coming up";
   var SECTIONS_HEAD = "Sections";
@@ -1072,15 +1072,12 @@
       const atRest = (next.state === "idle" || next.state === "ended") && next.progress == null;
       if (canContinue) continueBox.checked = host.continueToNextPage.get();
       if (canAutoScroll) scrollBox.checked = host.autoScroll.get();
-      const prefsLive = next.ttsRunning !== false;
+      const voiceLive = next.ttsRunning !== false;
       if (canRate) {
         const r = clampRate(host.rate.get());
         if (rateInput.value !== String(r)) rateInput.value = String(r);
         rateValue.textContent = rateReadout(r);
-        rateInput.disabled = !prefsLive;
-        rateWrap.title = prefsLive ? "" : CLIP_PREFS_REASON;
-        rateWrap.style.opacity = prefsLive ? "" : ".55";
-        rateWrap.style.cursor = prefsLive ? "pointer" : "not-allowed";
+        rateWrap.title = "";
       }
       if (canVoice) {
         const list = host.voice.list();
@@ -1103,10 +1100,10 @@
         const installed = chosen != null && list.some((v) => v.voiceURI === chosen);
         const want = installed ? chosen : "";
         if (voiceSelect.value !== want) voiceSelect.value = want;
-        voiceSelect.disabled = !prefsLive;
-        voiceWrap.title = prefsLive ? next.state === "playing" || next.state === "paused" ? VOICE_NEXT_PLAY_HINT : "" : CLIP_PREFS_REASON;
-        voiceWrap.style.opacity = prefsLive ? "" : ".55";
-        voiceWrap.style.cursor = prefsLive ? "pointer" : "not-allowed";
+        voiceSelect.disabled = !voiceLive;
+        voiceWrap.title = voiceLive ? next.state === "playing" || next.state === "paused" ? VOICE_NEXT_PLAY_HINT : "" : CLIP_VOICE_REASON;
+        voiceWrap.style.opacity = voiceLive ? "" : ".55";
+        voiceWrap.style.cursor = voiceLive ? "pointer" : "not-allowed";
       }
       notice.textContent = next.notice ?? "";
       notice.hidden = !next.notice;
@@ -1220,7 +1217,7 @@
     if (groups.length !== sections.length) return null;
     return groups;
   }
-  function createClipSource(doc, url, timeline, startAt = 0) {
+  function createClipSource(doc, url, timeline, startAt = 0, getRate = () => RATE_DEFAULT) {
     const el2 = doc.createElement("audio");
     el2.preload = "none";
     el2.src = url;
@@ -1289,8 +1286,15 @@
       };
       for (const fn of [...progressFns]) fn(p);
     };
+    const applyRate = () => {
+      const r = clampRate(getRate());
+      if (el2.defaultPlaybackRate !== r) el2.defaultPlaybackRate = r;
+      if (el2.playbackRate !== r) el2.playbackRate = r;
+    };
     el2.addEventListener("timeupdate", emitProgress);
     el2.addEventListener("loadedmetadata", emitProgress);
+    el2.addEventListener("timeupdate", applyRate);
+    el2.addEventListener("loadedmetadata", applyRate);
     let live = false;
     const fail = (why) => {
       if (!live) return;
@@ -1311,6 +1315,7 @@
         live = true;
         el2.currentTime = resumeFrom;
         resumeFrom = 0;
+        applyRate();
         const p = el2.play();
         if (p && typeof p.catch === "function") {
           p.catch((e) => {
@@ -1322,6 +1327,7 @@
         el2.pause();
       },
       resume() {
+        applyRate();
         const p = el2.play();
         if (p && typeof p.catch === "function") {
           p.catch((e) => {
@@ -2016,7 +2022,13 @@
           doc,
           clip.file,
           clip.sections ? { sections: clip.sections, items } : void 0,
-          at2 && at2.kind === "clip" ? at2.seconds : 0
+          at2 && at2.kind === "clip" ? at2.seconds : 0,
+          // The SAME getter over the SAME stored preference the speech source
+          // gets below (#376) — one `Speed` row, one `SpeechPrefs.rate`. Speed is
+          // the reader's listening pace, not a property of whichever engine
+          // happens to be running, so a second field for the clip would make one
+          // control mean two things.
+          () => readPagePrefs().rate
         );
         active = "clip";
         wordHighlight.clear();
@@ -2168,10 +2180,13 @@
         // press that fixes it. Removing either reopens #344.
         sourceLabel: transport.label(),
         switchLabel: switchWords(),
-        // Do the speed and voice rows govern what is PLAYING? (#212) The AI clip
-        // is a recorded file: its voice was baked in at generation time and its
-        // speed is not wired to these preferences, so while it plays both rows are
-        // disabled carrying a reason rather than left live and inert.
+        // Does the VOICE row govern what is playing? (#212, narrowed by #376.)
+        //
+        // The clip is a recorded file and its voice was baked into the samples at
+        // generation time — no runtime control can change it, so that row stays
+        // disabled with a reason while it plays. SPEED is no longer in that set:
+        // clip-source now takes the same rate getter the speech source does, so
+        // the slider governs both engines and is live throughout.
         ttsRunning: active !== "clip"
       });
     };
